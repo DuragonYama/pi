@@ -1,0 +1,21 @@
+# Runtime / per-profile state
+sessions/
+fleet/
+bg-logs/
+*.log
+acp-policy.log
+mcp-cache.json
+.DS_Store
+
+# Per-profile plumbing: symlinks into the shared ~/.pi/agent profile (machine-specific, not project content)
+acp-subagents.json
+agents
+auth.json
+extensions
+models-store.json
+models.json
+npm
+prompts
+subagent-models.json
+themes
+trust.json

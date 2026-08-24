@@ -1,0 +1,18 @@
+{
+  "name": "ofa-h",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "ofa-h": "./src/cli.ts"
+  },
+  "scripts": {
+    "ofa-h": "bun src/cli.ts",
+    "supervisor": "bun src/supervisor.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}

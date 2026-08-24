@@ -1,0 +1,16 @@
+{
+  "extends": "../../typecheck/tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "allowSyntheticDefaultImports": true
+  },
+  "include": ["*.ts", "test/**/*.ts"]
+}

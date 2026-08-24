@@ -1,0 +1,10 @@
+{
+  "defaultModel": "deepseek-v4-flash",
+  "defaultProvider": "deepseek",
+  "defaultThinkingLevel": "high",
+  "lastChangelogVersion": "0.84.2",
+  "packages": [
+    "npm:pi-mcp-adapter"
+  ],
+  "theme": "loom"
+}

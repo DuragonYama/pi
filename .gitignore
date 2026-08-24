@@ -1,0 +1,61 @@
+# ── ~/.pi unified repo — one repo for all pi profiles + the ofa-h fleet ──
+# Tracks source/config only. Secrets, deps, runtime state, and machine-specific
+# symlink plumbing are all excluded. Verified by a staged-secret audit at commit.
+
+# ── OS / editor cruft ──────────────────────────────────────────────
+.DS_Store
+*.swp
+
+# ── Secrets & auth — NEVER commit ──────────────────────────────────
+auth.json
+trust.json
+models-store.json
+*.key
+*.pem
+.env
+.env.*
+
+# ── Dependencies & build caches ────────────────────────────────────
+node_modules/
+typecheck/
+*.tsbuildinfo
+
+# ── Runtime state / transcripts / logs (per-device, ephemeral) ─────
+sessions/
+fleet/
+bg-logs/
+run/
+leases/
+jobs/
+engagements/
+*.log
+acp-policy.log
+mcp-cache.json
+scheduled_tasks.lock
+.hermes/
+.reviews/
+
+# ── Docker box runtime state volume ────────────────────────────────
+ofa-box-state/
+
+# ── Backups / cruft ────────────────────────────────────────────────
+*.bak
+*.bak-*
+models.*.bak
+settings.*.bak
+
+# ── Machine-specific profile plumbing (absolute-path symlinks into ──
+# ~/.pi/agent). The real files live in agent/ and ARE tracked; these
+# links are regenerated per-device by profile setup. A post-stage
+# sweep also unstages any symlink that escapes these patterns.
+/ofa-orch-h/acp-subagents.json
+/ofa-orch-h/agents
+/ofa-orch-h/extensions
+/ofa-orch-h/models.json
+/ofa-orch-h/npm
+/ofa-orch-h/prompts
+/ofa-orch-h/subagent-models.json
+/ofa-orch-h/themes
+/agent-solo/models.json
+/agent-solo/extensions
+/agent-solo/themes/loom.json

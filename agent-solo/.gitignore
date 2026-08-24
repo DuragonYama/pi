@@ -1,0 +1,14 @@
+# Machine-local plumbing (symlinks into ~/.pi/agent — secrets + shared catalogs).
+# The symlinks stay on disk; git just never tracks them.
+auth.json
+models.json
+models-store.json
+
+# Runtime / transcripts / logs
+sessions/
+bg-logs/
+*.log
+fleet/
+
+# OS cruft
+.DS_Store

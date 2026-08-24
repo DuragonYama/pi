@@ -1,0 +1,25 @@
+{
+  "name": "pi-web-tools-local",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "No-key web search and page fetching tools for pi",
+  "scripts": {
+    "test": "tsx test/smoke.ts"
+  },
+  "dependencies": {
+    "@mozilla/readability": "0.6.0",
+    "ipaddr.js": "2.5.0",
+    "jsdom": "30.0.1",
+    "turndown": "7.2.4",
+    "turndown-plugin-gfm": "1.0.2",
+    "undici": "8.10.0"
+  },
+  "devDependencies": {
+    "@types/jsdom": "30.0.0",
+    "@types/node": "24.10.1",
+    "@types/turndown": "5.0.6",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

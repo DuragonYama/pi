@@ -1,0 +1,10 @@
+{
+  "defaultModel": "Qwen3.8-27B-4bit",
+  "defaultProvider": "dflash2",
+  "defaultThinkingLevel": "medium",
+  "theme": "loom",
+  "lastChangelogVersion": "0.84.2",
+  "packages": [
+    "npm:pi-mcp-adapter"
+  ]
+}

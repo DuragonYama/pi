@@ -1,0 +1,10 @@
+{
+  "defaultModel": "gpt-5.6-luna",
+  "defaultProvider": "openai-codex",
+  "defaultThinkingLevel": "high",
+  "theme": "loom",
+  "lastChangelogVersion": "0.84.2",
+  "packages": [
+    "npm:pi-mcp-adapter"
+  ]
+}

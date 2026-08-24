@@ -1,0 +1,39 @@
+{
+  "agents": {
+    "claude": {
+      "command": "/Users/omer/.local/bin/claude-agent-acp",
+	  "inheritEnv": ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+      "modelOverride": { "env": { "ANTHROPIC_MODEL": "{model}" } },
+      "trust": "full"
+    },
+    "codex": {
+      "command": "/Users/omer/.local/bin/codex-acp",
+	  "inheritEnv": ["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+      "modelOverride": { "envJson": { "CODEX_CONFIG": { "model": "{model}" } } }
+    },
+    "cursor": {
+      "command": "/Users/omer/.local/bin/cursor-agent",
+      "args": ["acp"],
+	  "inheritEnv": ["CURSOR_API_KEY"],
+      "modelOverride": { "args": ["--model", "{model}"], "argsPosition": "prepend" },
+      "trust": "full"
+    },
+    "hermes": {
+      "command": "/Users/omer/.local/bin/hermes-acp",
+      "inheritEnv": [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OPENROUTER_API_KEY",
+        "BUZZ_PRIVATE_KEY",
+        "BUZZ_RELAY_URL",
+        "BUZZ_AUTH_TAG"
+      ]
+    },
+    "pi": {
+      "command": "/Users/omer/.local/bin/pi-acp",
+      "inheritEnv": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"],
+      "env": { "PI_ACP_DAEMON_IDLE_SECONDS": "60" }
+    }
+  }
+}

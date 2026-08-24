@@ -1,0 +1,24 @@
+# Secrets & auth
+auth.json
+*.log
+acp-policy.log
+
+# Generated stores
+models-store.json
+subagent-models.json
+
+# Sessions (transcripts)
+sessions/
+
+# Persistent-agent roster (holds resume session ids — never commit)
+fleet/
+
+# Dependencies
+node_modules/
+npm/node_modules/
+typecheck/node_modules/
+
+# OS cruft
+.DS_Store
+.hermes/
+.reviews/
