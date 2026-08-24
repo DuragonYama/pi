@@ -27,21 +27,47 @@ Versions match the host so in-container behavior is identical.
 Sources (override via env): `PI_AGENT_DIR` (~/.pi/agent), `ORCH_DIR` (~/.pi/ofa-orch-h),
 and this harness repo. No `node_modules`, `.git`, session state, or secrets enter the context.
 
-## Run
+## Auth model — runs on the operator's OWN logins, no foreign keys
 
-Credentials and state are mounted at runtime as **writable** volumes — never baked.
-(Write access is required: adapter OAuth tokens refresh in place, and the pi
-`models-store` updates on use.)
+The box authenticates entirely from credentials that belong to the machine it
+runs on. Nothing from the image author travels:
+
+| Layer | Auth | Source |
+|---|---|---|
+| L2 orchestrator + reviewer/worker/scout/planner roles | openai-codex (ChatGPT OAuth) | `pi auth` on the host → `~/.pi/agent/auth.json` |
+| codex L3 worker | `~/.codex` | already logged in on the box |
+| claude L3 worker | `~/.claude` / `~/.claude.json` | already logged in on the box |
+
+`subagent-models.container.json` remaps scout+planner (which the personal profile
+routes to a private deepseek key) onto openai-codex, so a single ChatGPT login
+covers the whole native path — no deepseek account needed. `trust.json` and an
+empty `models-store.json` are **baked** into the image (non-secret), so `auth.json`
+is the only host credential file the container mounts.
+
+**One-time host setup (operator does this — it's a login):**
+```bash
+pi auth        # log pi's openai-codex provider into THIS box's ChatGPT account
+```
+
+## Run as a service (always-on)
+
+```bash
+./service-box.sh                   # detached, --restart unless-stopped, survives reboot
+docker exec ofa-box pi --version   # verify
+docker exec ofa-box ofa-h start /root/.pi/ofa-orch-h   # bring up the warm L2
+```
+On Linux also ensure the Docker daemon starts on boot: `sudo systemctl enable --now docker`.
+
+## Run interactively (testing)
 
 ```bash
 ./run-box.sh                       # interactive shell in the box
 ./run-box.sh ofa-h status s_xxx    # one command and exit
-OFA_BOX_DETACH=1 ./run-box.sh sleep infinity   # background daemon (then `docker exec ofa-box ofa-h ...`)
 ```
 
-Mounted volumes:
-- `~/.pi/agent/{auth.json,models-store.json,trust.json}` — pi's own credentials
-- `~/.codex`, `~/.claude`, `~/.claude.json` — L3 adapter auth stores
+Mounted volumes (both scripts):
+- `~/.pi/agent/auth.json` — the operator's openai-codex login (**rw**, token refreshes in place)
+- `~/.codex`, `~/.claude`, `~/.claude.json` — L3 adapter auth stores (the box's own)
 - `~/.pi/ofa-box-state/{sessions,fleet}` — orchestrator state, **persisted across restarts**
   (satisfies the A.4 MUST-FIX: without this a `docker restart` loses engagement identity)
 

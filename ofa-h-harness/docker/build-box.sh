@@ -28,9 +28,11 @@ echo "assembling context in $CTX"
 # 1. extension tree (code only) + non-secret profile config
 rsync -a --exclude '.git' --exclude 'node_modules' "$PI_AGENT_DIR/extensions/" "$CTX/extensions/"
 mkdir -p "$CTX/agent-config"
-for f in models.json subagent-models.json; do
-  cp "$PI_AGENT_DIR/$f" "$CTX/agent-config/$f"
-done
+cp "$PI_AGENT_DIR/models.json" "$CTX/agent-config/models.json"
+# subagent role routing: the profile's copy sends scout/planner to a private
+# deepseek key. The container remaps those roles onto openai-codex so the box
+# runs entirely on the operator's own ChatGPT login — no foreign keys.
+cp "$HERE/subagent-models.container.json" "$CTX/agent-config/subagent-models.json"
 # container-path adapter config (host one hardcodes /Users/omer/.local/bin)
 cp "$HERE/acp-subagents.container.json" "$CTX/agent-config/acp-subagents.json"
 

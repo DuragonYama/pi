@@ -19,10 +19,10 @@ mkdir -p "$STATE/sessions" "$STATE/fleet"
 args=(run --rm --name "${OFA_BOX_NAME:-ofa-box}")
 if [ -n "${OFA_BOX_DETACH:-}" ]; then args+=(-d); else args+=(-it); fi
 
-# pi's own credentials (rw: pi refreshes models-store on use)
+# pi's own credential — the operator's openai-codex (ChatGPT) login, mounted rw so
+# the OAuth token refreshes in place. trust.json + models-store.json are baked into
+# the image (non-secret), so auth.json is the only host file this needs.
 args+=(-v "$PI_AGENT/auth.json:/root/.pi/agent/auth.json")
-args+=(-v "$PI_AGENT/models-store.json:/root/.pi/agent/models-store.json")
-args+=(-v "$PI_AGENT/trust.json:/root/.pi/agent/trust.json")
 
 # L3 adapter auth stores (rw: OAuth access-token refresh — proven necessary)
 args+=(-v "$HOME/.codex:/root/.codex")

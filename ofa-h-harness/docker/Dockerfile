@@ -42,6 +42,14 @@ RUN for d in /root/.pi/agent/extensions/acp-subagents /root/.pi/agent/extensions
 RUN cd /root/.pi/agent/npm && npm init -y >/dev/null 2>&1 \
     && npm install pi-mcp-adapter@2.27.0 --no-audit --no-fund 2>&1 | tail -1
 
+# Non-secret profile files that never travel in git (both gitignored on the host):
+#  - trust.json: pre-trust the orchestrator dir so pi runs headless without a prompt.
+#  - models-store.json: an empty cache; pi repopulates it at runtime.
+# auth.json is deliberately NOT baked — it is the one real secret and is mounted
+# at runtime (the operator's own ChatGPT/openai-codex login).
+RUN echo '{"/root/.pi/ofa-orch-h": true}' > /root/.pi/agent/trust.json \
+    && echo '{}' > /root/.pi/agent/models-store.json
+
 # --- orchestrator profile: boots here (PI_CODING_AGENT_DIR), plumbing symlinked to base ---
 ENV PI_CODING_AGENT_DIR=/root/.pi/ofa-orch-h
 COPY ofa-orch-h/ /root/.pi/ofa-orch-h/
