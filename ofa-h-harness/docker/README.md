@@ -44,10 +44,20 @@ covers the whole native path — no deepseek account needed. `trust.json` and an
 empty `models-store.json` are **baked** into the image (non-secret), so `auth.json`
 is the only host credential file the container mounts.
 
-**One-time host setup (operator does this — it's a login):**
+**One-time host setup — provision pi's `auth.json` (the box's own ChatGPT):**
+
+The box already authorized ChatGPT once, for its codex CLI (`~/.codex/auth.json`).
+Reshape that same token into pi's schema — no second browser login:
 ```bash
-pi auth        # log pi's openai-codex provider into THIS box's ChatGPT account
+python3 import-codex-auth.py     # ~/.codex/auth.json  ->  ~/.pi/agent/auth.json
 ```
+This stays entirely on the machine and reuses the box's own account. Verify after
+the box is up: `docker exec ofa-box pi auth check --provider openai-codex`.
+
+(Fallback, if the box has no codex login to reuse: run pi interactively in the
+image — `docker run --rm -it -v ~/.pi/agent/auth.json:/root/.pi/agent/auth.json
+ofa-box pi --provider openai-codex --model gpt-5.6-luna` — and complete the OAuth.
+pi's callback is `127.0.0.1:8080`, so over ssh forward that port.)
 
 ## Run as a service (always-on)
 
