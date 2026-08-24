@@ -55,9 +55,14 @@ args+=(-v "$HOME/.claude:/root/.claude")
 args+=(-v "$STATE/sessions:/root/.pi/ofa-orch-h/sessions")
 args+=(-v "$STATE/fleet:/root/.pi/ofa-orch-h/fleet")
 
-args+=("$IMAGE" sleep infinity)
+# On every container start (including after a host reboot), bring the L2
+# orchestrator up warm before parking PID1 on sleep. `ofa-h start` is idempotent:
+# it reclaims the durable engagement from the mounted state volume if one exists,
+# or starts fresh. So a rebooted host returns a READY orchestrator, not an idle
+# box. `|| true` keeps the container alive even if that first start hiccups.
+args+=("$IMAGE" bash -lc 'ofa-h start /root/.pi/ofa-orch-h >/tmp/ofa-boot.log 2>&1 || true; exec sleep infinity')
 
 docker "${args[@]}"
-echo "started $NAME (detached, --restart unless-stopped)"
-echo "verify:  docker exec $NAME pi --version"
-echo "drive:   docker exec $NAME ofa-h start /root/.pi/ofa-orch-h"
+echo "started $NAME (detached, --restart unless-stopped, L2 pre-warmed on boot)"
+echo "verify:  docker exec $NAME ofa-h ls"
+echo "drive:   docker exec $NAME ofa-h send <s_id> \"<prompt>\" --watch"
