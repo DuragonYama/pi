@@ -81,6 +81,7 @@ export function registerSubagentTool(deps: DispatchDeps): void {
 		onDelegationStart,
 		commsReady,
 		registerSpawnTurnAbort,
+		onPersistentTurnSettled,
 	} = persist;
 
 
@@ -252,6 +253,7 @@ export function registerSubagentTool(deps: DispatchDeps): void {
 				...(fleetEpochRuntime ? { fleetEpochRuntime } : {}),
 				commsMcpFor: persistent ? commsMcpFor : undefined,
 				onDelegationStart: persistent ? onDelegationStart : undefined,
+				onPersistentTurnSettled: persistent ? onPersistentTurnSettled : undefined,
 				commsReady: persistent ? commsReady : undefined,
 				// So /kill can abort a persistent agent's still-running spawn turn.
 				registerTurnAbort: persistent ? registerSpawnTurnAbort : undefined,

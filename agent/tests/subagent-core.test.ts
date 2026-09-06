@@ -362,8 +362,8 @@ assert.ok(
 	assert.equal(splitCount(/acceptedGeneration\(\)/g), 0, "planning must not stamp from the live accepted slot");
 	assert.equal(
 		splitCount(/currentTurnGeneration\(\)/g),
-		2,
-		"delegation stamps must snapshot the turn generation at ordinary planning and persistent-message entry",
+		3,
+		"delegation stamps must snapshot the turn generation at ordinary planning, persistent-message entry, and peer-outbox admission",
 	);
 	assert.equal(
 		(runnerSrc.match(/stampTask\(task, execution\.generation\)/g)?.length ?? 0),
@@ -564,7 +564,7 @@ for (const helperPath of [
 	assert.ok(onceIdx >= 0, "runPersistentOnce must exist");
 	const onceBlock = persistSource.slice(onceIdx, persistSource.indexOf("async function messagePersistent", onceIdx));
 	const messageBlock = persistSource.slice(persistSource.indexOf("async function messagePersistent"), persistSource.indexOf("function killPersistent"));
-	assert.ok(messageBlock.includes("const acceptedGen = fleetEpochRuntime?.currentTurnGeneration()"), "persistent re-message must snapshot the turn generation before entering its queue");
+	assert.ok(messageBlock.includes("const acceptedGen = opts?.acceptedGeneration ?? fleetEpochRuntime?.currentTurnGeneration()"), "persistent re-message must snapshot the turn generation before entering its queue (or reuse a peer-outbox submit-time snapshot)");
 	assert.ok(messageBlock.includes("acceptedGen,"), "the queued message must carry its submit-time generation into runPersistentOnce");
 	assert.ok(onceBlock.includes("fleetEpochRuntime?.isStale(acceptedGen)"), "a stale queued persistent message must bail before spawning");
 	const preWaitStale = onceBlock.indexOf("fleetEpochRuntime?.isStale(acceptedGen)");
@@ -586,8 +586,8 @@ for (const helperPath of [
 	assert.ok(onceBlock.includes("applyResumeNote"), "re-message path must prepend via applyResumeNote (not a raw string concat that tests cannot pin)");
 	assert.ok(onceBlock.includes("expectedResume"), "must snapshot meta.sessionId BEFORE runAcpStep (setSession mutates the store object)");
 	const snapAt = onceBlock.indexOf("const expectedResume");
-	const runAt = onceBlock.indexOf("await runAcpStep");
-	assert.ok(snapAt >= 0 && runAt > snapAt, "expectedResume must be captured before runAcpStep");
+	const runAt = onceBlock.indexOf("await runStep");
+	assert.ok(snapAt >= 0 && runAt > snapAt, "expectedResume must be captured before runStep (ACP runner seam)");
 	const acpStepFn = runnerSrc.slice(runnerSrc.indexOf("async function runAcpStep"), runnerSrc.indexOf("export async function runSingleAgent"));
 	assert.ok(!acpStepFn.includes("failedResumeNote"), "the note must not fire on the ordinary/first-spawn ACP path");
 	assert.ok(runnerSrc.includes("acpSessionCumulative"), "ACP usage must track last-seen cumulative per session id");

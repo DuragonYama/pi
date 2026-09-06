@@ -110,6 +110,8 @@ export interface StepExecution {
 	 * turn. Paired with commsMcpFor.
 	 */
 	onDelegationStart?: (loomId: string) => void;
+	/** Kick deferred peer delivery after an initial persistent spawn settles. */
+	onPersistentTurnSettled?: (loomId: string) => void;
 	/**
 	 * Ready-gate awaited before the comms server is resolved: lets the very first
 	 * delegation of a session briefly wait for the (one-tick) HTTP listen to bind,
