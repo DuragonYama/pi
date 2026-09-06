@@ -523,35 +523,59 @@ for (const mixed of [
 // matching the other suites.)
 
 {
-	const indexSource = fs.readFileSync(new URL("../extensions/subagent/index.ts", import.meta.url), "utf-8");
+	const siblingDir = new URL("../extensions/subagent/", import.meta.url);
+	const SPLIT_SOURCES = [
+		"index.ts",
+		"types.ts",
+		"format.ts",
+		"native-io.ts",
+		"loom.ts",
+		"runner.ts",
+		"schema.ts",
+		"persist.ts",
+		"dispatch.ts",
+		"render-subagent.ts",
+		"dm-ui.ts",
+		"tools-persistent.ts",
+		"models.ts",
+	] as const;
+	const splitSources = Object.fromEntries(
+		SPLIT_SOURCES.map((name) => [name, fs.readFileSync(new URL(name, siblingDir), "utf-8")]),
+	);
+	const indexSource = splitSources["index.ts"];
+	const dispatchSource = splitSources["dispatch.ts"];
+	const runnerSrc = splitSources["runner.ts"];
+	const schemaSource = splitSources["schema.ts"];
+	const toolsPersistentSource = splitSources["tools-persistent.ts"];
+	const noneHas = (needle: string) => SPLIT_SOURCES.every((name) => !splitSources[name].includes(needle));
 	assert.ok(
-		(indexSource.match(/background: backgroundSchema\(\)/g)?.length ?? 0) >= 3,
+		(schemaSource.match(/background: backgroundSchema\(\)/g)?.length ?? 0) >= 3,
 		"single mode, each parallel TaskItem, and each ChainItem must accept background",
 	);
-	assert.ok(indexSource.includes("resolveBackgroundMode"), "dispatch must validate background flags per request");
-	assert.ok(indexSource.includes("startBackgroundRun"), "dispatch must start background runs through the shared helper");
+	assert.ok(dispatchSource.includes("resolveBackgroundMode"), "dispatch must validate background flags per request");
+	assert.ok(dispatchSource.includes("startBackgroundRun"), "dispatch must start background runs through the shared helper");
 	assert.ok(indexSource.includes("BackgroundRunTracker"), "in-flight background runs must be tracked");
-	assert.ok(indexSource.includes("sendUserMessage"), "the completion ping must go through pi.sendUserMessage");
-	assert.ok(indexSource.includes("fleetEpochRuntime?.isStale(runGeneration)"), "stale background completions must be suppressed before sendUserMessage");
-	assert.ok(indexSource.includes("createFleetExitGate"), "background fleet registration must track worker process exit");
-	assert.ok(indexSource.includes("trackWorkerExit"), "inner background steps must bind the shared process-exit gate");
-	assert.ok(indexSource.includes('deliverAs: "steer"'), "pings must be delivered as steer messages (inject mid-turn, not queued)");
-	assert.ok(indexSource.includes("buildPersistentFollowUp"), "persistent_agent background must use the shared follow-up helper");
-	assert.ok(indexSource.includes('deliverAs: "followUp"'), "persistent_agent background replies must be followUp (queued), not steer");
-	assert.ok(indexSource.includes("isBusy"), "planning must reject requests on busy lanes before spawning");
-	assert.ok(indexSource.includes("laneBusyError"), "busy-lane rejections must use the actionable error");
+	assert.ok(dispatchSource.includes("sendUserMessage"), "the completion ping must go through pi.sendUserMessage");
+	assert.ok(dispatchSource.includes("fleetEpochRuntime?.isStale(runGeneration)"), "stale background completions must be suppressed before sendUserMessage");
+	assert.ok(dispatchSource.includes("createFleetExitGate"), "background fleet registration must track worker process exit");
 	assert.ok(
-		indexSource.includes("acquireLease") && indexSource.includes("releaseLease"),
+		dispatchSource.includes("trackWorkerExit") && runnerSrc.includes("trackWorkerExit"),
+		"inner background steps must bind the shared process-exit gate",
+	);
+	assert.ok(dispatchSource.includes('deliverAs: "steer"'), "pings must be delivered as steer messages (inject mid-turn, not queued)");
+	assert.ok(toolsPersistentSource.includes("buildPersistentFollowUp"), "persistent_agent background must use the shared follow-up helper");
+	assert.ok(toolsPersistentSource.includes('deliverAs: "followUp"'), "persistent_agent background replies must be followUp (queued), not steer");
+	assert.ok(dispatchSource.includes("isBusy"), "planning must reject requests on busy lanes before spawning");
+	assert.ok(dispatchSource.includes("laneBusyError"), "busy-lane rejections must use the actionable error");
+	assert.ok(
+		dispatchSource.includes("acquireLease") && dispatchSource.includes("releaseLease") && runnerSrc.includes("acquireLease") && runnerSrc.includes("releaseLease"),
 		"foreground ACP steps must lease their lane (token-owned) and release it in finally",
 	);
 	assert.ok(
-		indexSource.includes("onLeased") && indexSource.includes("laneToken"),
+		dispatchSource.includes("onLeased") && dispatchSource.includes("laneToken"),
 		"background runs must hand outer-owned lease tokens to steps so the inner runner skips acquire/release (P0 fix)",
 	);
-	assert.ok(
-		!indexSource.includes("markBusy") && !indexSource.includes("clearBusy"),
-		"the token-lease API must replace the old busy-mark API",
-	);
+	assert.ok(noneHas("markBusy") && noneHas("clearBusy"), "the token-lease API must replace the old busy-mark API");
 	assert.ok(indexSource.includes("abortAll"), "session_shutdown must abort all in-flight background runs");
 	assert.ok(indexSource.includes("abortExceptParent"), "session_start must abort runs from other parent sessions");
 }

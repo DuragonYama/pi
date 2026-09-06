@@ -22,6 +22,9 @@ import {
 	type NativeAffinityProfile,
 } from "../extensions/subagent/core.ts";
 import { failedResumeNote, applyResumeNote } from "../extensions/acp-subagents/core.ts";
+import { formatTokens, formatUsageStats, getDisplayItems, truncateParallelOutput } from "../extensions/subagent/format.ts";
+import { getPiInvocation } from "../extensions/subagent/native-io.ts";
+import { loomArgSummary, supersededResult } from "../extensions/subagent/loom.ts";
 
 for (const reason of ["refusal", "cancelled", "max_tokens", "max_turn_requests", "error", "aborted"]) {
 	assert.equal(isFailedStopReason(reason, "acp"), true, `${reason} must fail an ACP result`);
@@ -275,31 +278,55 @@ const requireError = nativeContinuityError("require");
 assert.ok(requireError, 'native continuity="require" must produce a validation error');
 assert.match(requireError!, /native/i, "the error must explain that native children keep no sessions");
 
-// --- Dispatch wiring: the tool source must thread the new controls ---
+// --- Dispatch wiring: owning-module source pins (B3 split) ---
 // index.ts cannot be imported under plain node (pi package resolution exists
-// only for tsc), so assert its wiring at the source level, like the harness
-// surface gate does.
+// only for tsc), so assert wiring at the source level. After the split, greps
+// that pin call-sites follow the owning module; absence asserts sweep ALL
+// new siblings + index.ts.
 
-const indexSource = readFileSync(new URL("../extensions/subagent/index.ts", import.meta.url), "utf-8");
+const siblingDir = new URL("../extensions/subagent/", import.meta.url);
+const SPLIT_SOURCES = [
+	"index.ts",
+	"types.ts",
+	"format.ts",
+	"native-io.ts",
+	"loom.ts",
+	"runner.ts",
+	"schema.ts",
+	"persist.ts",
+	"dispatch.ts",
+	"render-subagent.ts",
+	"dm-ui.ts",
+	"tools-persistent.ts",
+	"models.ts",
+] as const;
+const splitSources = Object.fromEntries(SPLIT_SOURCES.map((name) => [name, readFileSync(new URL(name, siblingDir), "utf-8")]));
+const indexSource = splitSources["index.ts"];
+const dispatchSource = splitSources["dispatch.ts"];
+const persistSource = splitSources["persist.ts"];
+const runnerSrc = splitSources["runner.ts"];
+const schemaSource = splitSources["schema.ts"];
+const toolsPersistentSource = splitSources["tools-persistent.ts"];
+const noneHas = (needle: string) => SPLIT_SOURCES.every((name) => !splitSources[name].includes(needle));
+const splitCount = (re: RegExp) =>
+	SPLIT_SOURCES.reduce((n, name) => n + (splitSources[name].match(re)?.length ?? 0), 0);
+
+assert.ok(noneHas("NATIVE_AGENT_TIMEOUT_MS"), "the hardcoded native timeout constant must be replaced by per-step timeouts");
+assert.ok(noneHas("1200 * 1000"), "the hardcoded ACP delegation timeout must be replaced by per-step timeouts");
 assert.ok(
-	!indexSource.includes("NATIVE_AGENT_TIMEOUT_MS"),
-	"the hardcoded native timeout constant must be replaced by per-step timeouts",
+	dispatchSource.includes("resolveStepTimeoutMs") && persistSource.includes("resolveStepTimeoutMs"),
+	"both runners must resolve per-step timeouts",
 );
 assert.ok(
-	!indexSource.includes("1200 * 1000"),
-	"the hardcoded ACP delegation timeout must be replaced by per-step timeouts",
-);
-assert.ok(indexSource.includes("resolveStepTimeoutMs"), "both runners must resolve per-step timeouts");
-assert.ok(
-	(indexSource.match(/timeoutSeconds/g)?.length ?? 0) >= 3,
+	(schemaSource.match(/timeoutSeconds/g)?.length ?? 0) >= 3,
 	"single, parallel, and chain schemas must each accept timeoutSeconds",
 );
-assert.ok(indexSource.includes("nativeContinuityError"), 'dispatch must reject native continuity="require"');
-assert.ok(indexSource.includes("firstDuplicateAcpLane"), "parallel dispatch must reject duplicate lane identities");
-assert.ok(indexSource.includes("decideLaneLabel"), "dispatch must decide + validate lane labels (decideLaneLabel normalizes internally)");
-assert.ok(indexSource.includes("deriveAcpLaneKey"), "dispatch must compute lane identities before spawning");
+assert.ok(dispatchSource.includes("nativeContinuityError"), 'dispatch must reject native continuity="require"');
+assert.ok(dispatchSource.includes("firstDuplicateAcpLane"), "parallel dispatch must reject duplicate lane identities");
+assert.ok(dispatchSource.includes("decideLaneLabel"), "dispatch must decide + validate lane labels (decideLaneLabel normalizes internally)");
+assert.ok(dispatchSource.includes("deriveAcpLaneKey"), "dispatch must compute lane identities before spawning");
 assert.ok(
-	indexSource.includes("registerTurnAbort") && indexSource.includes("registerSpawnTurnAbort"),
+	dispatchSource.includes("registerTurnAbort") && persistSource.includes("registerSpawnTurnAbort"),
 	"/kill must be able to abort a persistent agent's INITIAL spawn turn (registerTurnAbort wired from planStep into runAcpStep)",
 );
 assert.ok(
@@ -322,35 +349,31 @@ assert.ok(
 		/fleetEpochFile \? new FleetEpochRuntime\(fleetEpochFile\) : undefined/,
 		"an empty PI_FLEET_EPOCH_FILE must not construct the runtime",
 	);
-	assert.ok(!indexSource.includes('pi.on("tool_call"'), "Stage 2 must not register the Stage-3 barrier hook");
+	assert.ok(noneHas('pi.on("tool_call"'), "Stage 2 must not register the Stage-3 barrier hook");
 
-	const acpStep = indexSource.slice(indexSource.indexOf("async function runAcpStep"), indexSource.indexOf("function getResultOutput"));
+	const acpStep = runnerSrc.slice(runnerSrc.indexOf("async function runAcpStep"), runnerSrc.indexOf("export async function runSingleAgent"));
 	assert.ok(acpStep.includes("task: wireTask"), "ACP delegation must receive the stamped wire task");
 	assert.ok(acpStep.includes("task,"), "ACP SingleResult/roster metadata must retain the original task");
 	assert.ok(
-		indexSource.includes("task: execution.fleetEpochRuntime?.stampTask(task, execution.generation) ?? task"),
+		runnerSrc.includes("task: execution.fleetEpochRuntime?.stampTask(task, execution.generation) ?? task"),
 		"native delegation must stamp only its wire task and leave the result task unchanged",
 	);
-	assert.ok(indexSource.includes("recordExchange(meta.loomId, { from, prompt: task"), "persistent history must record the original unstamped task");
+	assert.ok(persistSource.includes("recordExchange(meta.loomId, { from, prompt: task"), "persistent history must record the original unstamped task");
+	assert.equal(splitCount(/acceptedGeneration\(\)/g), 0, "planning must not stamp from the live accepted slot");
 	assert.equal(
-		indexSource.match(/acceptedGeneration\(\)/g)?.length ?? 0,
-		0,
-		"planning must not stamp from the live accepted slot",
-	);
-	assert.equal(
-		indexSource.match(/currentTurnGeneration\(\)/g)?.length,
+		splitCount(/currentTurnGeneration\(\)/g),
 		2,
 		"delegation stamps must snapshot the turn generation at ordinary planning and persistent-message entry",
 	);
 	assert.equal(
-		indexSource.match(/stampTask\(task, execution\.generation\)/g)?.length,
+		(runnerSrc.match(/stampTask\(task, execution\.generation\)/g)?.length ?? 0),
 		2,
 		"ACP and native wire stamps must use the execution snapshot",
 	);
-	assert.ok(indexSource.includes("}, execution.generation);"), "persistent register must use the execution snapshot");
-	assert.ok(indexSource.includes("persistentAgents.touch(loomId, { task }, execution.generation)"), "spawn settlement must use the execution snapshot");
+	assert.ok(runnerSrc.includes("}, execution.generation);"), "persistent register must use the execution snapshot");
+	assert.ok(runnerSrc.includes("persistentAgents.touch(loomId, { task }, execution.generation)"), "spawn settlement must use the execution snapshot");
 	assert.ok(
-		indexSource.includes("generation: fleetEpochRuntime?.currentTurnGeneration()"),
+		dispatchSource.includes("generation: fleetEpochRuntime?.currentTurnGeneration()"),
 		"ordinary single/fan-out/native/ACP planning must capture the turn generation once",
 	);
 
@@ -368,16 +391,16 @@ assert.ok(
 		"un-gated ACP RunOptions must omit trackWorkerExit instead of carrying an undefined field",
 	);
 	assert.ok(
-		indexSource.includes("execution.fleetEpochRuntime &&") && indexSource.includes("const local = new AbortController()"),
+		runnerSrc.includes("execution.fleetEpochRuntime &&") && runnerSrc.includes("const local = new AbortController()"),
 		"the foreground linked controller must be constructed only inside the active fleet gate",
 	);
 	assert.equal(
-		indexSource.match(/fleetEpochRuntime\?\.isStale\(executions\[i\]\.generation\)/g)?.length,
+		(dispatchSource.match(/fleetEpochRuntime\?\.isStale\(executions\[i\]\.generation\)/g)?.length ?? 0),
 		2,
 		"both foreground and background chain loops must fence stale queued steps",
 	);
 	assert.ok(
-		indexSource.includes("return supersededResult(agentName, task, step, execution.lane)"),
+		runnerSrc.includes("return supersededResult(agentName, task, step, execution.lane)"),
 		"a delegation that becomes stale before registration must return cleanly without spawning",
 	);
 }
@@ -388,7 +411,8 @@ assert.ok(
 // These guard against silent drift: if the guideline vanishes, or stops naming
 // the tool it describes, the always-on knowledge rots and the bug can regress.
 assert.ok(
-	indexSource.includes("promptGuidelines") && indexSource.includes("promptSnippet"),
+	(toolsPersistentSource.includes("promptGuidelines") && toolsPersistentSource.includes("promptSnippet")) &&
+		(dispatchSource.includes("promptGuidelines") && dispatchSource.includes("promptSnippet")),
 	"persistent_agent/subagent must surface promptSnippet + promptGuidelines (the always-on channel), not rely on tool-schema description alone",
 );
 {
@@ -397,9 +421,9 @@ assert.ok(
 	// prompt never names. (Coupling test per the 2026-08-18 design board.)
 	const commsSource = readFileSync(new URL("../extensions/subagent/comms-server.ts", import.meta.url), "utf-8");
 	if (commsSource.includes("message_agent")) {
-		const paIdx = indexSource.indexOf('name: "persistent_agent"');
+		const paIdx = toolsPersistentSource.indexOf('name: "persistent_agent"');
 		assert.ok(paIdx >= 0, "persistent_agent tool must exist");
-		const paBlock = indexSource.slice(paIdx, paIdx + 2000);
+		const paBlock = toolsPersistentSource.slice(paIdx, paIdx + 2000);
 		assert.ok(
 			paBlock.includes("promptGuidelines") && paBlock.includes("message_agent"),
 			"persistent_agent.promptGuidelines must name message_agent while comms-server still exports it",
@@ -407,8 +431,7 @@ assert.ok(
 		// The persistent_agent tool (list/history/message) must NEVER surface a
 		// session id to the model — the resume spine now lives on disk (roster.json)
 		// as well as in memory, so this guard matters more, not less.
-		const paEnd = indexSource.indexOf('name: "subagent"', paIdx);
-		const paTool = indexSource.slice(paIdx, paEnd > paIdx ? paEnd : paIdx + 4000);
+		const paTool = toolsPersistentSource;
 		assert.ok(!paTool.includes("sessionId"), "persistent_agent list/history/message output must never include a session id");
 		assert.ok(paTool.includes('"peek"'), "persistent_agent must expose action peek");
 		assert.ok(paTool.includes("formatLanePeek"), "peek must render through formatLanePeek (no ad-hoc string concat)");
@@ -425,11 +448,8 @@ assert.deepEqual(planProjectAgentGate([], true), { action: "proceed" });
 assert.deepEqual(planProjectAgentGate(["repo-bot"], false), { action: "deny" }, "no UI must fail closed");
 assert.deepEqual(planProjectAgentGate(["repo-bot"], true), { action: "confirm" }, "UI must always ask");
 assert.equal(planProjectAgentGate.length, 2, "the gate must not accept a caller-controlled bypass flag");
-assert.ok(
-	!indexSource.includes("confirmProjectAgents"),
-	"the model-visible confirmProjectAgents bypass must be gone from schema and dispatch",
-);
-assert.ok(indexSource.includes("planProjectAgentGate"), "dispatch must route project agents through the trust gate");
+assert.ok(noneHas("confirmProjectAgents"), "the model-visible confirmProjectAgents bypass must be gone from schema and dispatch");
+assert.ok(dispatchSource.includes("planProjectAgentGate"), "dispatch must route project agents through the trust gate");
 
 // --- Worker preset: explicit minimum implementation toolbelt ---
 // Registered built-in tool names (pi dist/core/tools): bash, edit, find, grep,
@@ -454,6 +474,18 @@ for (const helperPath of [
 	"../extensions/subagent/core.ts",
 	"../extensions/subagent/agents.ts",
 	"../extensions/subagent/index.ts",
+	"../extensions/subagent/types.ts",
+	"../extensions/subagent/format.ts",
+	"../extensions/subagent/native-io.ts",
+	"../extensions/subagent/loom.ts",
+	"../extensions/subagent/runner.ts",
+	"../extensions/subagent/schema.ts",
+	"../extensions/subagent/persist.ts",
+	"../extensions/subagent/dispatch.ts",
+	"../extensions/subagent/render-subagent.ts",
+	"../extensions/subagent/dm-ui.ts",
+	"../extensions/subagent/tools-persistent.ts",
+	"../extensions/subagent/models.ts",
 	"../extensions/acp-subagents/core.ts",
 	"../extensions/acp-subagents/runner.ts",
 ]) {
@@ -528,10 +560,10 @@ for (const helperPath of [
 }
 
 {
-	const onceIdx = indexSource.indexOf("async function runPersistentOnce");
+	const onceIdx = persistSource.indexOf("async function runPersistentOnce");
 	assert.ok(onceIdx >= 0, "runPersistentOnce must exist");
-	const onceBlock = indexSource.slice(onceIdx, indexSource.indexOf("async function messagePersistent", onceIdx));
-	const messageBlock = indexSource.slice(indexSource.indexOf("async function messagePersistent"), indexSource.indexOf("function killPersistent"));
+	const onceBlock = persistSource.slice(onceIdx, persistSource.indexOf("async function messagePersistent", onceIdx));
+	const messageBlock = persistSource.slice(persistSource.indexOf("async function messagePersistent"), persistSource.indexOf("function killPersistent"));
 	assert.ok(messageBlock.includes("const acceptedGen = fleetEpochRuntime?.currentTurnGeneration()"), "persistent re-message must snapshot the turn generation before entering its queue");
 	assert.ok(messageBlock.includes("acceptedGen,"), "the queued message must carry its submit-time generation into runPersistentOnce");
 	assert.ok(onceBlock.includes("fleetEpochRuntime?.isStale(acceptedGen)"), "a stale queued persistent message must bail before spawning");
@@ -556,9 +588,9 @@ for (const helperPath of [
 	const snapAt = onceBlock.indexOf("const expectedResume");
 	const runAt = onceBlock.indexOf("await runAcpStep");
 	assert.ok(snapAt >= 0 && runAt > snapAt, "expectedResume must be captured before runAcpStep");
-	const acpStepFn = indexSource.slice(indexSource.indexOf("async function runAcpStep"), indexSource.indexOf("function getResultOutput"));
+	const acpStepFn = runnerSrc.slice(runnerSrc.indexOf("async function runAcpStep"), runnerSrc.indexOf("export async function runSingleAgent"));
 	assert.ok(!acpStepFn.includes("failedResumeNote"), "the note must not fire on the ordinary/first-spawn ACP path");
-	assert.ok(indexSource.includes("acpSessionCumulative"), "ACP usage must track last-seen cumulative per session id");
+	assert.ok(runnerSrc.includes("acpSessionCumulative"), "ACP usage must track last-seen cumulative per session id");
 	assert.ok(acpStepFn.includes("deltaAcpUsage"), "runAcpStep must map the per-turn delta, not the session lifetime total");
 	assert.ok(acpStepFn.includes("peekKey"), "runAcpStep must feed the ACP peek buffer with the lane key");
 	const commsReadyAt = acpStepFn.indexOf("await execution.commsReady");
@@ -567,6 +599,32 @@ for (const helperPath of [
 	const betweenCommsAndStamp = acpStepFn.slice(commsReadyAt, rosterStampAt);
 	assert.ok(betweenCommsAndStamp.includes("isStale"), "runAcpStep must re-check staleness after commsReady before the roster stamp");
 	assert.ok(betweenCommsAndStamp.includes("supersededResult"), "a stale remessage must return superseded without stamping the roster");
+}
+
+// --- Phase 1 import unlock: helpers are callable under strip-types (additions) ---
+{
+	assert.equal(formatTokens(500), "500");
+	assert.equal(formatTokens(1500), "1.5k");
+	assert.equal(formatUsageStats({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }), "");
+	assert.equal(formatUsageStats({ input: 1000, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2 }), "2 turns ↑1.0k");
+	assert.equal(truncateParallelOutput("short"), "short");
+	assert.deepEqual(
+		getDisplayItems([{ role: "assistant", content: [{ type: "text", text: "hi" }] } as any]),
+		[{ type: "text", text: "hi" }],
+	);
+	const inv = getPiInvocation(["--mode", "json"]);
+	assert.equal(typeof inv.command, "string");
+	assert.ok(Array.isArray(inv.args));
+	const stale = supersededResult("claude", "do the thing", 2, "default");
+	assert.equal(stale.exitCode, 1);
+	assert.equal(stale.stopReason, "superseded");
+	assert.equal(stale.stderr, "Superseded by a newer fleet generation before delegation startup.");
+	assert.equal(stale.agent, "claude");
+	assert.equal(stale.task, "do the thing");
+	assert.equal(stale.step, 2);
+	assert.equal(stale.lane, "default");
+	assert.equal(loomArgSummary({ path: "/tmp/foo" }), "/tmp/foo");
+	assert.equal(loomArgSummary(null), undefined);
 }
 
 console.log("ALL SUBAGENT CORE TESTS PASSED");
