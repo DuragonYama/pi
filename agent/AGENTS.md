@@ -24,6 +24,37 @@ codex, …) and coordinate them. Invariants of THIS harness — rely on them:
 Deeper how-tos (comms limits, `/dm` `>>` grammar, the Loom monitor, spawn flags) load
 on demand — see the `pi-orchestration` skill.
 
+## Dispatch discipline (always)
+
+Lessons from the 2026-09-06 multi-worker build — encoded here because they failed in
+practice when they lived only in the orchestrator's head:
+
+1. **Verify dispatch receipt.** Receipts cover peer `message_agent` dispatches only —
+   `persistent_agent message` to a busy worker is still reject-if-busy (no queue, no
+   receipt): if it returns busy, retry on the worker's next idle or let the user queue
+   via /dm. For a peer dispatch: check `persistent_agent list`/`peek` for queue depth
+   and last receipt. A queued receipt means delivery is owned by the outbox — wait for
+   its `delivered`/`failed`/`dropped` terminal state; do NOT re-send (that duplicates).
+   Retry only when a dispatch produced NO receipt id at all. A worker reply is the
+   strongest receipt; a queued acknowledgement is not a delivery.
+2. **Merge-cycle cross-check.** At every merge/turn boundary, reconcile each worker's
+   assigned work (and any dispatched-but-unacknowledged work orders) against its actual
+   in-flight turns before assuming the pipeline is loaded. An idle worker with no
+   assignment is a pipeline stall, not a rest.
+3. **Rotate before bloat.** Long-lived workers accumulate context and ACP sessions die
+   opaquely on resume past ~1MB. Rotate at a natural turn boundary (fresh worker +
+   file-based handoff: reviews/specs/commit hashes), don't wait for the death.
+4. **Briefs state how to verify.** Every work order includes the exact rebuild/test
+   commands for the artifacts under test ("rebuild exactly what you test" — a stale
+   binary produces false FAILs and costs a verification round).
+5. **Reconcile scope at milestone time.** Before a milestone review, reconcile the task
+   documents' criteria against the shipped surface; record accepted deferrals in the
+   task docs with explicit destinations. Never let a reviewer discover scope drift for
+   you — treat it as a gate blocker otherwise (it was, once).
+6. **Reviews are files; reviews are not done by the orchestrator's memory.** The
+   reviewer writes findings to `.reviews/<name>.md`; the orchestrator reads the file
+   when the corresponding task's ping arrives, never as an interruption.
+
 ## Review workflow (always)
 
 When Omer asks for stepwise fixes with external reviewers (e.g. cursor/grok):

@@ -22,6 +22,12 @@ whole point of agent-to-agent comms.
 
 - **Agent-to-agent comms** (`message_agent` / `read_history`, limits, delegation
   patterns, the router-mode anti-pattern): see [references/agent-comms.md](references/agent-comms.md).
+- **Peer outbox + delivery receipts** (busy targets queue durably instead of
+  silently dropping; receipts visible via `persistent_agent list`/`peek`): the
+  outbox lives in `extensions/subagent/peer-outbox.ts` (design:
+  `~/.pi/agent/.reviews/queue-design.md`). Worker replies are the strongest
+  receipt; a queued acknowledgement is not. Added 2026-09-06 after two lost
+  dispatches in one day.
 - **/dm and `>>` chains, spawning, lanes, the Loom monitor**: not yet written as
   references. Probe the code (`extensions/subagent/`, `extensions/acp-subagents/`) or
   ask — and when a topic proves worth documenting, add a `references/<topic>.md` and a
