@@ -1,8 +1,8 @@
 {
-  "defaultModel": "deepseek-v4-flash",
-  "defaultProvider": "deepseek",
+  "defaultModel": "glm-5.3-flash",
+  "defaultProvider": "opencode-go",
   "defaultThinkingLevel": "high",
-  "lastChangelogVersion": "0.84.2",
+  "lastChangelogVersion": "0.85.0",
   "packages": [
     "npm:pi-mcp-adapter"
   ],

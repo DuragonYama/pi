@@ -17,7 +17,11 @@ models-store.json
 
 # ── Dependencies & build caches ────────────────────────────────────
 node_modules/
-typecheck/
+# Gate TypeScript project: track config only (node_modules/ covers deps).
+# Slash-containing patterns are root-relative; **/ reaches agent/typecheck/.
+**/typecheck/*
+!**/typecheck/tsconfig.json
+!**/typecheck/package.json
 *.tsbuildinfo
 
 # ── Runtime state / transcripts / logs (per-device, ephemeral) ─────
@@ -34,6 +38,7 @@ mcp-cache.json
 scheduled_tasks.lock
 .hermes/
 .reviews/
+.usage/
 
 # ── Docker box runtime state volume ────────────────────────────────
 ofa-box-state/
@@ -58,4 +63,9 @@ settings.*.bak
 /ofa-orch-h/themes
 /agent-solo/models.json
 /agent-solo/extensions
+/agent-solo/npm
 /agent-solo/themes/loom.json
+
+# runtime state / caches (2026-09-06)
+agent/mcp-onboarding.json
+__pycache__/

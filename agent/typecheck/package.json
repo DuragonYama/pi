@@ -1,0 +1,8 @@
+{
+  "name": "pi-harness-typecheck",
+  "private": true,
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

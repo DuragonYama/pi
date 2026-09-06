@@ -18,7 +18,11 @@
  *   FAKE_ACP_ECHO_ID_STDERR   "1" echoes the session id to stderr after session/new
  *   FAKE_ACP_ECHO_ID_TEXT     "1" includes the session id in a text chunk
  *   FAKE_ACP_NEW_OK           "0" makes session/new fail with a JSON-RPC error
+ *   FAKE_ACP_SET_CONFIG_OK    "0" makes session/set_config_option fail
+ *   FAKE_ACP_MODEL_OPTIONS    comma-separated model ids advertised on session/new
  *   FAKE_ACP_DIE_MID_PROMPT   "1" exits the adapter process mid-prompt-turn
+ *   FAKE_ACP_PROMPT_ERROR     if set, session/prompt fails with this JSON-RPC message
+ *                             after the session exists (post-establish error path)
  *   FAKE_ACP_USAGE            "1" include PromptResponse.usage (known fixture numbers)
  *   FAKE_ACP_IGNORE_SIGTERM_MS  delay process exit after SIGTERM (and ignore stdin-close exit)
  */
@@ -38,6 +42,7 @@ const echoIdStderr = process.env.FAKE_ACP_ECHO_ID_STDERR === "1";
 const echoIdText = process.env.FAKE_ACP_ECHO_ID_TEXT === "1";
 const newOk = process.env.FAKE_ACP_NEW_OK !== "0";
 const dieMidPrompt = process.env.FAKE_ACP_DIE_MID_PROMPT === "1";
+const promptError = process.env.FAKE_ACP_PROMPT_ERROR;
 const emitUsage = process.env.FAKE_ACP_USAGE === "1";
 const ignoreSigtermMs = Number(process.env.FAKE_ACP_IGNORE_SIGTERM_MS ?? "0");
 
@@ -98,6 +103,8 @@ async function handleLine(line) {
 		sessionId: params?.sessionId ?? null,
 		cwd: params?.cwd ?? null,
 		mcpServers: Array.isArray(params?.mcpServers) ? params.mcpServers.length : null,
+		configId: params?.configId ?? null,
+		value: params?.value ?? null,
 	});
 
 	if (method === "initialize") {
@@ -116,8 +123,40 @@ async function handleLine(line) {
 			send({ jsonrpc: "2.0", id, error: { code: -32603, message: "cannot create session" } });
 			return;
 		}
-		send({ jsonrpc: "2.0", id, result: { sessionId: newSessionId } });
+		const modelOptions = (process.env.FAKE_ACP_MODEL_OPTIONS ?? "")
+			.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean);
+		const result = { sessionId: newSessionId };
+		if (modelOptions.length > 0) {
+			result.configOptions = [
+				{
+					id: "model",
+					type: "select",
+					name: "Model",
+					currentValue: modelOptions[0],
+					options: modelOptions.map((value) => ({ value, name: value })),
+				},
+			];
+		}
+		send({ jsonrpc: "2.0", id, result });
 		if (echoIdStderr) process.stderr.write(`created session ${newSessionId}\n`);
+		return;
+	}
+	if (method === "session/set_config_option") {
+		if (process.env.FAKE_ACP_SET_CONFIG_OK === "0") {
+			send({ jsonrpc: "2.0", id, error: { code: -32602, message: `Unknown config option: ${params?.configId}` } });
+			return;
+		}
+		send({
+			jsonrpc: "2.0",
+			id,
+			result: {
+				configOptions: [
+					{ id: params?.configId ?? "model", currentValue: params?.value ?? "" },
+				],
+			},
+		});
 		return;
 	}
 	if (method === "session/load") {
@@ -132,6 +171,10 @@ async function handleLine(line) {
 		return;
 	}
 	if (method === "session/prompt") {
+		if (promptError) {
+			send({ jsonrpc: "2.0", id, error: { code: -32603, message: promptError } });
+			return;
+		}
 		if (hangOnPrompt) return; // never respond; the runner must kill us
 		if (wantPermission) {
 			const requestId = nextOutboundId++;

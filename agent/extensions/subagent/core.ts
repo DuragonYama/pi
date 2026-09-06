@@ -5,18 +5,10 @@ import {
 	registerFleetExecution,
 	type FleetEpochRuntime,
 } from "../shared/fleet-epoch.ts";
+import { utf8HeadWithin, utf8TailWithin } from "../shared/utf8.ts";
 
 const DEFAULT_CHAIN_HANDOFF_CAP = 50 * 1024;
 const HANDOFF_REFERENCE = "[Previous step output inserted at the first placeholder]";
-
-function utf8TailWithin(text: string, maxBytes: number): string {
-	if (maxBytes <= 0) return "";
-	const bytes = Buffer.from(text, "utf8");
-	if (bytes.length <= maxBytes) return text;
-	let start = bytes.length - maxBytes;
-	while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++;
-	return bytes.subarray(start).toString("utf8");
-}
 
 export function boundChainHandoff(output: string, capBytes = DEFAULT_CHAIN_HANDOFF_CAP): string {
 	const totalBytes = Buffer.byteLength(output, "utf8");
@@ -221,15 +213,6 @@ export interface BackgroundStepOutcome {
 export const BACKGROUND_PING_MAX_BYTES = 2048;
 const PING_TASK_PREVIEW_BYTES = 96;
 
-function utf8HeadWithin(text: string, maxBytes: number): string {
-	if (maxBytes <= 0) return "";
-	const bytes = Buffer.from(text, "utf8");
-	if (bytes.length <= maxBytes) return text;
-	let end = maxBytes;
-	while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
-	return bytes.subarray(0, end).toString("utf8");
-}
-
 /**
  * Build the single bounded completion ping for a finished background run:
  * what ran, per-step outcome, and the tail of each final text. The whole
@@ -255,6 +238,22 @@ export function buildBackgroundPing(
 		return `- ${label} (${outcome.status}) ${task}${detail ? ` — ${detail}` : ""}`;
 	});
 	return utf8HeadWithin([header, ...lines].join("\n"), capBytes);
+}
+
+/**
+ * Bounded follow-up ping for a fire-and-forget persistent_agent message.
+ * Same byte cap as background subagent pings; never a session ID.
+ */
+export function buildPersistentFollowUp(
+	name: string,
+	result: { text?: string; error?: string },
+	capBytes = BACKGROUND_PING_MAX_BYTES,
+): string {
+	const header = result.error
+		? `[persistent_agent] @${name} failed.`
+		: `[persistent_agent] @${name} replied.`;
+	const body = (result.error ?? result.text ?? "").replace(/\s+/g, " ").trim();
+	return utf8HeadWithin([header, body].join("\n"), capBytes);
 }
 
 /**

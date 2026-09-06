@@ -7,10 +7,13 @@ import {
 	AcpLaneRegistry,
 	AcpResumeUnsupportedError,
 	AcpSessionUnusableError,
+	AcpModelOverrideError,
 	AcpStaleGenerationError,
 	AcpTurnUncertainError,
 	appendBoundedUtf8,
+	advertisedSessionConfigValues,
 	applyModelOverride,
+	resolveExactSessionConfigValue,
 	createBoundedLineTransform,
 	DEFAULT_LANE_LABEL,
 	deriveAcpLaneKey,
@@ -69,6 +72,68 @@ assert.throws(
 	/does not declare model override support/,
 );
 
+const sessionConfigParsed = parseAgentConfig({
+	agents: {
+		pi: {
+			command: "/tmp/pi-acp",
+			env: { PI_CODING_AGENT_DIR: "/tmp/agent-solo" },
+			modelOverride: { sessionConfig: { configId: "model", value: "{model}" } },
+		},
+	},
+});
+const sessionOverridden = applyModelOverride(sessionConfigParsed.agents.pi, "openai-codex/gpt-5.6-sol");
+assert.deepEqual(sessionOverridden.env, { PI_CODING_AGENT_DIR: "/tmp/agent-solo" });
+assert.equal(sessionOverridden.args, undefined);
+assert.deepEqual(sessionOverridden.modelOverride?.sessionConfig, {
+	configId: "model",
+	value: "openai-codex/gpt-5.6-sol",
+});
+assert.equal(
+	sessionConfigParsed.agents.pi.modelOverride?.sessionConfig?.value,
+	"{model}",
+	"applyModelOverride must not mutate the parsed template",
+);
+
+const envAndSession = parseAgentConfig({
+	agents: {
+		pi: {
+			command: "/tmp/pi-acp",
+			env: { PI_CODING_AGENT_DIR: "/tmp/agent-solo" },
+			modelOverride: {
+				sessionConfig: { configId: "model", value: "{model}" },
+				env: { PI_ACP_MODEL_OVERRIDE: "{model}" },
+			},
+		},
+	},
+});
+const envAndSessionApplied = applyModelOverride(envAndSession.agents.pi, "openai-codex/gpt-5.4");
+assert.equal(envAndSessionApplied.env?.PI_ACP_MODEL_OVERRIDE, "openai-codex/gpt-5.4");
+assert.equal(envAndSessionApplied.env?.PI_CODING_AGENT_DIR, "/tmp/agent-solo");
+assert.deepEqual(envAndSessionApplied.modelOverride?.sessionConfig, {
+	configId: "model",
+	value: "openai-codex/gpt-5.4",
+});
+
+{
+	const advertised = advertisedSessionConfigValues(
+		[
+			{
+				id: "model",
+				options: [
+					{ value: "openai-codex/gpt-5.4" },
+					{ group: "go", options: [{ value: "opencode-go/glm-5.1" }] },
+				],
+			},
+		],
+		"model",
+	);
+	assert.deepEqual(advertised, ["openai-codex/gpt-5.4", "opencode-go/glm-5.1"]);
+	assert.equal(resolveExactSessionConfigValue("openai-codex/gpt-5.4", advertised), "openai-codex/gpt-5.4");
+	assert.equal(resolveExactSessionConfigValue("gpt-5.4", advertised), "openai-codex/gpt-5.4");
+	assert.equal(resolveExactSessionConfigValue("openai-codex/gpt-5.6-sol", advertised), undefined);
+	assert.equal(resolveExactSessionConfigValue("gpt-5.6-sol", advertised), undefined);
+}
+
 for (const invalid of [
 	null,
 	{},
@@ -77,13 +142,42 @@ for (const invalid of [
 	{ agents: { bad: { command: "" } } },
 	{ agents: { bad: { command: "x", args: [1] } } },
 	{ agents: { bad: { command: "x", env: { TOKEN: 1 } } } },
-	{ agents: { bad: { command: "x", modelOverride: { argsPosition: "middle" } } } },
-	{ agents: { bad: { command: "x", modelOverride: { env: { MODEL: "fixed" } } } } },
-	{ agents: { bad: { command: "x", modelOverride: { env: { MODEL: "prefix-{model}" } } } } },
-	{ agents: { bad: { command: "x", modelOverride: { args: ["--model"] } } } },
-	{ agents: { bad: { command: "x", modelOverride: { envJson: { CONFIG: { model: "fixed" } } } } } },
 ]) {
 	assert.throws(() => parseAgentConfig(invalid), /ACP config/);
+}
+
+{
+	const warnings: string[] = [];
+	const soft = parseAgentConfig(
+		{
+			agents: {
+				claude: {
+					command: "/tmp/claude-agent-acp",
+					modelOverride: { env: { ANTHROPIC_MODEL: "{model}" } },
+				},
+				pi: {
+					command: "/tmp/pi-acp",
+					modelOverride: { futureHook: "{model}" },
+				},
+				brokenOverride: {
+					command: "/tmp/other",
+					modelOverride: { sessionConfig: { configId: "model", value: "fixed" } },
+				},
+			},
+		},
+		(message) => warnings.push(message),
+	);
+	assert.deepEqual(Object.keys(soft.agents).sort(), ["brokenOverride", "claude", "pi"]);
+	assert.deepEqual(soft.agents.claude.modelOverride?.env, { ANTHROPIC_MODEL: "{model}" });
+	assert.equal(soft.agents.pi.modelOverride, undefined);
+	assert.equal(soft.agents.brokenOverride.modelOverride, undefined);
+	assert.equal(warnings.length, 2);
+	assert.match(warnings[0] ?? "", /model overrides unavailable/);
+	assert.match(warnings[1] ?? "", /model overrides unavailable/);
+	assert.throws(
+		() => applyModelOverride(soft.agents.pi, "gpt-5.4"),
+		/does not declare model override support/,
+	);
 }
 
 // --- ACP config loading must fail closed; no built-in adapter fallback ---
@@ -131,8 +225,39 @@ try {
 	const badAgentPath = path.join(tmpConfigDir, "bad-agent.json");
 	fs.writeFileSync(badAgentPath, JSON.stringify({ agents: { bad: { command: "" } } }));
 	assert.throws(() => loadConfigFromPath(badAgentPath), /Invalid ACP config/);
+
+	// A bad modelOverride on one adapter must not reject siblings.
+	const mixedPath = path.join(tmpConfigDir, "mixed-override.json");
+	fs.writeFileSync(
+		mixedPath,
+		JSON.stringify({
+			agents: {
+				claude: { command: "/tmp/claude-agent-acp", modelOverride: { env: { ANTHROPIC_MODEL: "{model}" } } },
+				pi: { command: "/tmp/pi-acp", modelOverride: { futureHook: "{model}" } },
+			},
+		}),
+	);
+	const mixed = loadConfigFromPath(mixedPath);
+	assert.deepEqual(mixed.agents.claude.modelOverride?.env, { ANTHROPIC_MODEL: "{model}" });
+	assert.equal(mixed.agents.pi.modelOverride, undefined);
 } finally {
 	fs.rmSync(tmpConfigDir, { recursive: true, force: true });
+}
+
+{
+	const live = loadConfigFromPath(path.join(import.meta.dirname, "..", "acp-subagents.json"));
+	assert.deepEqual(live.agents.pi.modelOverride?.sessionConfig, {
+		configId: "model",
+		value: "{model}",
+	});
+	assert.deepEqual(live.agents.pi.modelOverride?.env, { PI_ACP_MODEL_OVERRIDE: "{model}" });
+	const applied = applyModelOverride(live.agents.pi, "gpt-5.6-sol");
+	assert.deepEqual(applied.modelOverride?.sessionConfig, { configId: "model", value: "gpt-5.6-sol" });
+	assert.equal(applied.env?.PI_ACP_MODEL_OVERRIDE, "gpt-5.6-sol");
+	assert.equal(applied.env?.PI_CODING_AGENT_DIR, "/Users/omer/.pi/agent-solo");
+	assert.deepEqual(live.agents.claude.modelOverride?.env, { ANTHROPIC_MODEL: "{model}" });
+	assert.deepEqual(live.agents.codex.modelOverride?.envJson, { CODEX_CONFIG: { model: "{model}" } });
+	assert.deepEqual(live.agents.cursor.modelOverride?.args, ["--model", "{model}"]);
 }
 
 // Native-only delegation must never trigger the ACP config loader.
@@ -590,6 +715,11 @@ assert.equal(
 assert.equal(shouldInvalidateLane(new Error("Delegation was aborted")), false, "parent cancel must not drop the lane");
 assert.equal(shouldInvalidateLane(new Error("Delegation timed out after 30s")), false, "timeouts must not drop the lane");
 assert.equal(shouldInvalidateLane(new AcpStaleGenerationError("superseded")), false, "fleet barrier kills must keep the lane resumable");
+assert.equal(
+	shouldInvalidateLane(new AcpModelOverrideError("unknown model")),
+	false,
+	"a rejected model override must not drop a healthy loaded lane",
+);
 assert.equal(shouldInvalidateLane("string error"), false);
 assert.equal(shouldInvalidateLane(undefined), false);
 
@@ -616,6 +746,39 @@ assert.equal(shouldInvalidateLane(new AcpTurnUncertainError("died mid-prompt")),
 	registry.register("lane-b", "parent", "session-b");
 	for (let i = 0; i < 24; i++) registry.recordSuccessfulTurn("lane-b");
 	assert.equal(registry.resolve("lane-b", "require").action, "unavailable");
+}
+
+{
+	const dropped: string[] = [];
+	let now = 0;
+	const registry = new AcpLaneRegistry({
+		maxEntries: 2,
+		idleMs: 1000,
+		now: () => now,
+		onDrop: (key) => dropped.push(key),
+	});
+	registry.register("old", "parent", "sess-old");
+	now = 1;
+	registry.register("keep", "parent", "sess-keep");
+	now = 2;
+	registry.register("new", "parent", "sess-new");
+	assert.ok(dropped.includes("old"), "LRU evict must fire onDrop");
+	now = 3;
+	registry.register("keep", "parent", "sess-keep-2");
+	assert.ok(!dropped.includes("keep"), "same-key re-register must not onDrop the surviving lane");
+	registry.invalidate("keep");
+	assert.ok(!dropped.includes("keep"), "invalidate must NOT drop peek (last error stays readable)");
+	now = 5000;
+	registry.resolve("new", "auto");
+	assert.ok(dropped.includes("new"), "idle expire must fire onDrop");
+	registry.register("p1", "parent-a", "s1");
+	registry.register("p2", "parent-b", "s2");
+	dropped.length = 0;
+	registry.clearExceptParent("parent-a");
+	assert.deepEqual(dropped, ["p2"], "clearExceptParent must onDrop foreign lanes");
+	dropped.length = 0;
+	registry.clear();
+	assert.ok(dropped.includes("p1"), "clear must onDrop remaining lanes");
 }
 
 // --- decideLaneLabel: standing agents get a solo lane (the "default" no-op bug) --

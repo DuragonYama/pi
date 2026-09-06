@@ -111,6 +111,17 @@ import { loopGuard, startCommsServer, type CommsDeps } from "../extensions/subag
 		// Revoke kills a live agent's token (e.g. on /kill): further requests 403.
 		server.revoke("loom-caller");
 		assert.equal((await post({ jsonrpc: "2.0", id: 10, method: "tools/list" }, token)).status, 403, "revoked token can no longer route");
+
+		// revokeExcept drops everyone not in the keep set (session_start clearExceptParent).
+		live.add("loom-keep");
+		live.add("loom-drop");
+		const keepCfg = server.mcpServerFor("loom-keep") as { headers: Array<{ name: string; value: string }> };
+		const dropCfg = server.mcpServerFor("loom-drop") as { headers: Array<{ name: string; value: string }> };
+		const keepToken = keepCfg.headers.find((h) => h.name === "x-pi-token")!.value;
+		const dropToken = dropCfg.headers.find((h) => h.name === "x-pi-token")!.value;
+		server.revokeExcept(["loom-keep"]);
+		assert.equal((await post({ jsonrpc: "2.0", id: 11, method: "tools/list" }, keepToken)).status, 200, "kept token still routes");
+		assert.equal((await post({ jsonrpc: "2.0", id: 12, method: "tools/list" }, dropToken)).status, 403, "dropped token is revoked");
 	} finally {
 		await server.close();
 	}

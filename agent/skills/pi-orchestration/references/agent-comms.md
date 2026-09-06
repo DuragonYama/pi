@@ -1,6 +1,6 @@
 # Agent-to-agent comms
 
-Verified against **pi 0.84.2, 2026-08-18** (`extensions/subagent/comms-server.ts`,
+Verified against **pi 0.85.0, 2026-09-06** (`extensions/subagent/comms-server.ts`,
 `extensions/subagent/index.ts`).
 
 ## What exists
@@ -52,7 +52,7 @@ explicitly in the prompt so the worker reaches for it.
 - **Self-message is blocked.**
 - **Reject-if-busy.** Messaging a worker mid-turn is rejected rather than queued, so a
   message never blocks the caller's turn.
-- **Per-turn cap:** a worker may originate at most `MCP_MSGS_PER_TURN` = 6 `message_agent`
+- **Per-turn cap:** a worker may originate at most `MCP_MSGS_PER_TURN` = 12 `message_agent`
   sends per turn (enforced in `index.ts`); beyond that it's told to finish the turn first.
 - **Text cap:** messages are truncated to `MAX_TEXT_CHARS` = 24,000 characters.
 - Two standing workers must be on **different lanes** to message each other; omitting the

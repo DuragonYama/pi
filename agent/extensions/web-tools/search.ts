@@ -1,4 +1,4 @@
-import { BROWSER_HEADERS, errorMessage, readLimitedBody } from "./network.js";
+import { decodeBody, errorMessage, fetchPublicResource } from "./network.js";
 
 const SEARCH_TIMEOUT_MS = 15_000;
 const MAX_SEARCH_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -173,7 +173,7 @@ function buildBingUrl(query: string, freshness: Freshness | undefined, rss = fal
 	return url;
 }
 
-async function fetchSearchDocument(
+export async function fetchSearchDocument(
 	url: URL,
 	engineName: string,
 	signal: AbortSignal | undefined,
@@ -181,21 +181,19 @@ async function fetchSearchDocument(
 	const timeoutSignal = AbortSignal.timeout(SEARCH_TIMEOUT_MS);
 	const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 	try {
-		const response = await fetch(url, {
+		const resource = await fetchPublicResource(url.href, {
 			signal: requestSignal,
-			redirect: "follow",
+			timeoutMs: SEARCH_TIMEOUT_MS,
+			maxBytes: MAX_SEARCH_RESPONSE_BYTES,
 			headers: {
-				...BROWSER_HEADERS,
 				accept: "text/html,application/xhtml+xml,application/rss+xml,application/xml;q=0.9,*/*;q=0.5",
 			},
 		});
-		if (!response.ok) throw new Error(`${engineName} returned HTTP ${response.status}`);
-		const body = await readLimitedBody(response, MAX_SEARCH_RESPONSE_BYTES);
-		return new TextDecoder("utf-8").decode(body);
+		return decodeBody(resource.body, resource.contentType);
 	} catch (error) {
 		if (signal?.aborted) throw new Error("Web search cancelled");
 		if (timeoutSignal.aborted) throw new Error("Web search timed out");
-		throw error;
+		throw new Error(`${engineName}: ${errorMessage(error)}`);
 	}
 }
 
@@ -311,7 +309,7 @@ function filterToDomains(results: SearchResult[], domains: string[] | undefined)
 	});
 }
 
-async function parseDuckDuckGoHtml(html: string, limit: number): Promise<SearchResult[]> {
+export async function parseDuckDuckGoHtml(html: string, limit: number): Promise<SearchResult[]> {
 	const JSDOM = await getJSDOM();
 	const dom = new JSDOM(html, { url: "https://html.duckduckgo.com/html/" });
 	const results: SearchResult[] = [];

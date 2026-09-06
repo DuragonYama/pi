@@ -33,9 +33,10 @@ Every step (single, parallel task, chain step) accepts three optional fields:
 - `timeoutSeconds`: per-step timeout, integer 30–14400, default 1200. Threaded
   to both native and ACP runners; timeout kill/escalation behavior unchanged.
 
-Lanes live in a bounded in-memory registry (32 entries, 60-minute idle expiry,
-24-turn cap, LRU eviction) scoped to the parent Pi session and cleared on
-session lifecycle events; nothing persists across a Pi restart. ACP session
+Lanes live in a bounded in-memory registry (128 entries, 240-minute idle
+expiry, 100-turn cap, LRU eviction; env-tunable via `PI_FLEET_*`) scoped to
+the parent Pi session and cleared on session lifecycle events; nothing
+persists across a Pi restart. ACP session
 IDs stay in memory only — tool details show redacted statuses (`fresh`,
 `loaded`, `rotated`, `unavailable`), never IDs. Parallel tasks that resolve to
 the same lane identity are rejected up front rather than raced or silently
@@ -73,6 +74,17 @@ leases span the detached run; foreground requests pre-lease before spawning and
 release after their steps finish. On session shutdown (or a session switch) all
 in-flight background process groups are killed through the existing
 SIGTERM→SIGKILL escalation, so no adapter outlives pi.
+
+## Lane peek and failure text
+
+Each active ACP lane keeps a bounded in-memory peek record (32 lanes, 16
+recent tool calls, 800-byte assistant tail, 1024-byte last error; UTF-8
+capped via `shared/utf8.ts`). `persistent_agent` action `"peek"` reads it.
+The record is LRU-evicted and dropped when the lane is idle-expired, parent-
+cleared, or the standing agent is killed; a tainted-session invalidate keeps
+the last error readable. Post-establish ACP failures now carry the adapter's
+verbatim error plus the pinned package/SDK versions from the adapter
+`package.json` (no drift-check, no network).
 
 ## Agent adapters
 
@@ -131,8 +143,11 @@ Model override example:
 }
 ```
 
-If an adapter has no `modelOverride`, requesting a model fails explicitly; it
-is never silently ignored.
+If an adapter has no usable `modelOverride`, requesting a model fails
+explicitly for that adapter; it is never silently ignored. An unrecognized or
+malformed `modelOverride` shape is dropped with a warning (`stderr` and
+`acp-policy.log`) so the rest of the fleet still loads — only invalid JSON or
+a broken agent declaration (missing/relative command, …) rejects the file.
 
 Plain `modelOverride.env` values must equal `{model}` exactly. For structured
 environment values such as JSON, use `envJson`; the harness substitutes the
@@ -143,17 +158,70 @@ injection:
 { "envJson": { "CODEX_CONFIG": { "model": "{model}" } } }
 ```
 
+Pi has no spawn-time model hook (shared daemon, in-process sessions). The pi
+adapter uses `sessionConfig` (`session/set_config_option`, configId `model`)
+plus a compat no-op env key `PI_ACP_MODEL_OVERRIDE` so older in-memory
+runners still accept the file. **Pi model overrides only work in sessions
+started after that runner change — restart the orchestrator session.** The
+override catalog is whatever pi-acp advertises on `session/new`, not
+`models-store.json`.
+
 ## Safety model
 
-- Subagent `session/request_permission` calls are routed through pi's policy:
-  read/search/think/fetch kinds are auto-approved.
-- Everything else asks the user: Allow once / Allow for this delegation /
-  Reject. Session-scoped approvals last for one delegation.
-- Destructive-command patterns (same list as `bash-guard.ts`) are flagged in
-  the prompt.
-- No UI (`pi -p`, RPC): anything needing permission is rejected.
+The live policy is `PolicyClient` in `runner.ts`. In short:
+
+- **Grant (2026-08-13):** a non-dangerous write/edit/execute (or any other
+  non-read kind) with a present, inspected, non-dangerous payload is
+  auto-allowed. Ordinary coding work does not raise a modal. The danger
+  classifier (`findDangerous` / `findSsrf`, same list as `bash-guard.ts`) is
+  the floor: `rm -rf`, `curl|bash`, device wipes, fork-bombs, SSRF skip the
+  grant and fall through.
+- **`trust:"full"`** on the **claude** and **cursor** adapters bypasses the
+  danger scan, the absent-payload deny, and every prompt. Every operation is
+  auto-allowed. This is the only path that skips the danger floor. Codex,
+  hermes, and pi run the default policy.
+- **Allow-always never exists.** The adapter may advertise an `allow_always`
+  option; the client never selects it. "Allow for this delegation" is
+  emulated locally in a per-delegation `Set` and dies with that run.
+- **No-UI fails closed.** `pi -p`, RPC, and any `forceNonInteractive`
+  delegation (agent→agent comms) auto-deny danger-scanned ops rather than
+  prompting. Safe reads and the non-dangerous grant still auto-allow.
+- **Stale-generation fence** (`runner.ts`, precedes full-trust): a stale
+  fleet worker may keep reading (`read`/`search`/`think`) but cannot gain a
+  new side-effecting grant, including fetch.
+- **MCP `message_agent` / `read_history` bypass PolicyClient entirely.**
+  Those calls go child → in-process HTTP server and never hit
+  `session/request_permission` (see `scripts/mcp-probe-results.md`). The
+  comms server's own checks are the sole authorization boundary.
 - Per-delegation timeout (`timeoutSeconds`, 30–14400s, default 20 min) and
   abort support kill the subagent process group.
+
+## Security posture
+
+The danger classifier (`findDangerous` / `findSsrf` in `shared/danger.ts`) is
+the permission boundary for every adapter that is **not** `trust:"full"`. It
+is heuristic, not a sandbox: it flags command-boundary patterns and a small
+set of wrappers (`command`, `env`). Known accepted holes — keep these in
+mind; they are not treated as defects of the current floor:
+
+- argv-shaped `rm` that the recursive-rm scanner does not see as `-r`/`-f`
+- `bash -c` / `sh -c` wrappers (the inner script is not re-parsed)
+- `$()` / backtick indirection
+- `command` / `env` unwrapping limits (only the common forms above)
+- writes to sensitive paths (`~/.ssh`, `~/.pi`, …) that are not themselves
+  a classified command
+- MCP `message_agent` / `read_history` bypass PolicyClient entirely (see
+  Safety above and `scripts/mcp-probe-results.md`)
+- ACP failure-text scrub: a keyword-adjacent token is treated as an opaque
+  session id when it contains a digit, an uppercase letter, or a hyphen
+  (`session abc123`, `{"sessionId":"…"}`). Pure lowercase snake_case error
+  words (`resource_exhausted`) survive. Pure-digit forms (`session 429`)
+  are therefore scrubbed — a known false-positive direction, accepted so
+  short numeric session ids cannot leak.
+
+`trust:"full"` adapters (claude, cursor today) skip the classifier, the
+absent-payload deny, and every prompt — by owner choice, not by accident.
+Full-trust is the only path that leaves the danger floor.
 
 ## Test agent
 

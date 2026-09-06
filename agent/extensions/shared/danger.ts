@@ -54,6 +54,30 @@ export const DANGEROUS_PATTERNS: Pattern[] = [
 	{ re: new RegExp(CMD + BIN + String.raw`dd\s+[^|;&\n]*of=\/dev\/`, "i"), label: "dd writing to /dev" },
 	{ re: new RegExp(CMD + BIN + String.raw`(shutdown|reboot|halt|poweroff)\b`), label: "power state change" },
 	{ re: /:\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}/, label: "fork bomb" },
+	{ re: new RegExp(CMD + BIN + String.raw`shred\b`), label: "shred" },
+	// truncate is command-position checked in isSensitiveTruncate (not CMD-regex).
+	{ re: new RegExp(CMD + BIN + String.raw`launchctl\b`), label: "launchctl" },
+	{ re: new RegExp(CMD + BIN + String.raw`crontab\b`), label: "crontab" },
+	{
+		re: new RegExp(
+			CMD +
+				BIN +
+				String.raw`git\s+(?:-[a-zA-Z]+(?:\s+\S+)?\s+|--[a-z-]+(?:=(?:\S+)|(?:\s+\S+))?\s+)*filter-branch\b`,
+			"i",
+		),
+		label: "git filter-branch",
+	},
+	{
+		// npm global/config options before the subcommand, space- or =-valued:
+		//   npm --workspace foo publish | npm --prefix /tmp/pkg publish
+		//   npm --registry=https://registry.npmjs.org publish
+		re: new RegExp(
+			CMD +
+				BIN +
+				String.raw`npm\s+(?:-[a-zA-Z]+(?:\s+\S+)?\s+|--[a-z-]+(?:=(?:\S+)|(?:\s+\S+))?\s+)*publish\b`,
+		),
+		label: "npm publish",
+	},
 ];
 
 /**
@@ -223,9 +247,8 @@ export function findSsrf(text: string): Pattern | undefined {
 
 const RM_BIN = /^(\S*\/)?rm$/;
 
-function unwrapCommonWrapper(segment: string): string | undefined {
-	const tokens = segment.trim().split(/\s+/);
-	if (tokens.length < 2) return undefined;
+/** Advance past `command` / `env` wrappers. May rewrite a `--split-string=` token in place. */
+function skipWrapperTokens(tokens: string[]): number {
 	let commandIndex = 0;
 	const wrapperName = (tokens[commandIndex] ?? "").split("/").pop();
 	if (wrapperName === "command") {
@@ -264,6 +287,13 @@ function unwrapCommonWrapper(segment: string): string | undefined {
 			break;
 		}
 	}
+	return commandIndex;
+}
+
+function unwrapCommonWrapper(segment: string): string | undefined {
+	const tokens = segment.trim().split(/\s+/);
+	if (tokens.length < 2) return undefined;
+	const commandIndex = skipWrapperTokens(tokens);
 	if (commandIndex === 0 || commandIndex >= tokens.length) return undefined;
 	return tokens
 		.slice(commandIndex)
@@ -286,45 +316,7 @@ function isRecursiveRm(command: string): boolean {
 	for (const segment of segments) {
 		const tokens = segment.trim().split(/\s+/);
 		if (tokens.length < 2) continue;
-		let commandIndex = 0;
-		const wrapperName = (tokens[commandIndex] ?? "").split("/").pop();
-		if (wrapperName === "command") {
-			commandIndex++;
-			while ((tokens[commandIndex] ?? "").startsWith("-")) commandIndex++;
-		}
-		const envName = (tokens[commandIndex] ?? "").split("/").pop();
-		if (envName === "env") {
-			commandIndex++;
-			while (commandIndex < tokens.length) {
-				const token = tokens[commandIndex] ?? "";
-				if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
-					commandIndex++;
-					continue;
-				}
-				if (token === "--") {
-					commandIndex++;
-					break;
-				}
-				if (["-u", "--unset", "-C", "--chdir"].includes(token)) {
-					commandIndex += 2;
-					continue;
-				}
-				if (token === "-S" || token === "--split-string") {
-					// env parses the following split string as the command plus args.
-					commandIndex++;
-					break;
-				}
-				if (token.startsWith("--split-string=")) {
-					tokens[commandIndex] = token.slice("--split-string=".length);
-					break;
-				}
-				if (token.startsWith("-")) {
-					commandIndex++;
-					continue;
-				}
-				break;
-			}
-		}
+		const commandIndex = skipWrapperTokens(tokens);
 		const normalizeSplitToken = (token: string) => token.replace(/^["']+/, "").replace(/["'\\]+$/, "");
 		if (!RM_BIN.test(normalizeSplitToken(tokens[commandIndex] ?? ""))) continue;
 
@@ -338,10 +330,35 @@ function isRecursiveRm(command: string): boolean {
 	return false;
 }
 
+const TRUNCATE_BIN = /^(\S*\/)?truncate$/;
+const SENSITIVE_TRUNCATE_ARG = /(?:\/dev\/|~\/\.ssh\b|~\/\.gnupg\b|~\/\.pi\b)/;
+
+/**
+ * truncate of a block device or well-known sensitive path, only when the
+ * wrapper-aware tokenizer treats `truncate` as the invocation (so
+ * `echo truncate /dev/x` is not flagged).
+ */
+function isSensitiveTruncate(command: string): boolean {
+	const segments = command.split(/[;&|]/);
+	for (const segment of segments) {
+		const tokens = segment.trim().split(/\s+/);
+		if (tokens.length < 2) continue;
+		const commandIndex = skipWrapperTokens(tokens);
+		const normalizeSplitToken = (token: string) => token.replace(/^["']+/, "").replace(/["'\\]+$/, "");
+		if (!TRUNCATE_BIN.test(normalizeSplitToken(tokens[commandIndex] ?? ""))) continue;
+		const rest = tokens.slice(commandIndex + 1).map(normalizeSplitToken).join(" ");
+		if (SENSITIVE_TRUNCATE_ARG.test(rest)) return true;
+	}
+	return false;
+}
+
 /** Returns the first dangerous pattern matching the command, if any. */
 export function findDangerous(command: string): Pattern | undefined {
 	if (isRecursiveRm(command)) {
 		return { re: /rm/, label: "recursive rm" };
+	}
+	if (isSensitiveTruncate(command)) {
+		return { re: /truncate/, label: "truncate of block device/sensitive path" };
 	}
 	const direct = DANGEROUS_PATTERNS.find((p) => p.re.test(command));
 	if (direct) return direct;

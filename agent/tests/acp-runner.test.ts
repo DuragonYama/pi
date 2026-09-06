@@ -18,8 +18,10 @@ import {
 	AcpTurnUncertainError,
 	shouldInvalidateLane,
 	type ContinuityMode,
+	type ModelOverrideConfig,
 } from "../extensions/acp-subagents/core.ts";
 import { PolicyClient, runDelegation, normalizeAcpUsage, deltaAcpUsage, type AcpSessionEstablished, type AcpTurnUsage } from "../extensions/acp-subagents/runner.ts";
+import { resetLanePeekForTests } from "../extensions/acp-subagents/lane-peek.ts";
 import {
 	createFleetExitGate,
 	FLEET_ENGAGEMENT_MARKER,
@@ -46,6 +48,8 @@ interface CallRecord {
 	sessionId?: string | null;
 	cwd?: string | null;
 	mcpServers?: number | null;
+	configId?: string | null;
+	value?: string | null;
 	pid?: number;
 	outcome?: { outcome: string; optionId?: string } | null;
 }
@@ -66,6 +70,8 @@ async function runFixture(options: {
 	signal?: AbortSignal;
 	task?: string;
 	cwd?: string;
+	modelOverride?: ModelOverrideConfig;
+	peekKey?: string;
 }): Promise<RunOutcome> {
 	const logPath = path.join(tmpBase, `calls-${runCounter++}.ndjson`);
 	const established: AcpSessionEstablished[] = [];
@@ -75,6 +81,7 @@ async function runFixture(options: {
 			command: process.execPath,
 			args: [FIXTURE],
 			env: { FAKE_ACP_CALL_LOG: logPath, ...(options.env ?? {}) },
+			modelOverride: options.modelOverride,
 		},
 		cwd: options.cwd ?? tmpBase,
 		task: options.task ?? "say hi",
@@ -86,6 +93,7 @@ async function runFixture(options: {
 		continuityMode: options.continuityMode,
 		onSessionEstablished: (info) => established.push(info),
 		onPromptSubmitted: () => promptAttempts++,
+		peekKey: options.peekKey,
 	});
 	const calls = readCalls(logPath);
 	return { result, established, promptAttempts, calls, bootPid: bootPidOf(calls) };
@@ -738,6 +746,147 @@ async function waitForExit(pid: number): Promise<boolean> {
 			}
 		}
 	}
+}
+
+// --- sessionConfig model override: session/set_config_option before prompt ---
+
+{
+	const { result, calls } = await runFixture({
+		env: { FAKE_ACP_SESSION_ID: "session-config-fresh" },
+		modelOverride: {
+			sessionConfig: { configId: "model", value: "openai-codex/gpt-5.6-sol" },
+			env: { PI_ACP_MODEL_OVERRIDE: "openai-codex/gpt-5.6-sol" },
+		},
+	});
+	assert.deepEqual(methodsOf(calls), ["initialize", "session/new", "session/set_config_option", "session/prompt"]);
+	assert.equal(
+		calls.filter((c) => c.method === "session/set_config_option").length,
+		1,
+		"env+sessionConfig must apply session/set_config_option once, not twice",
+	);
+	const setCall = calls.find((c) => c.method === "session/set_config_option")!;
+	assert.equal(setCall.sessionId, "session-config-fresh");
+	assert.equal(setCall.configId, "model");
+	assert.equal(setCall.value, "openai-codex/gpt-5.6-sol");
+	assert.equal(result.stopReason, "end_turn");
+	assert.ok(result.text.includes("echo:say hi"));
+}
+
+{
+	const { result, calls } = await runFixture({
+		env: { FAKE_ACP_LOAD_CAPABILITY: "1" },
+		resumeSessionId: "session-config-loaded",
+		continuityMode: "auto",
+		modelOverride: { sessionConfig: { configId: "model", value: "gpt-5.6-sol" } },
+	});
+	assert.deepEqual(methodsOf(calls), ["initialize", "session/load", "session/set_config_option", "session/prompt"]);
+	const setCall = calls.find((c) => c.method === "session/set_config_option")!;
+	assert.equal(setCall.sessionId, "session-config-loaded");
+	assert.equal(setCall.configId, "model");
+	assert.equal(setCall.value, "gpt-5.6-sol");
+	assert.equal(result.continuity, "loaded");
+	assert.equal(result.stopReason, "end_turn");
+}
+
+{
+	await assert.rejects(
+		() =>
+			runFixture({
+				env: { FAKE_ACP_SESSION_ID: "session-config-fail", FAKE_ACP_SET_CONFIG_OK: "0" },
+				modelOverride: { sessionConfig: { configId: "model", value: "unknown-model" } },
+			}),
+		/failed to apply model override via session\/set_config_option/,
+	);
+}
+
+{
+	await assert.rejects(
+		() =>
+			runFixture({
+				env: {
+					FAKE_ACP_SESSION_ID: "session-config-unknown",
+					FAKE_ACP_MODEL_OPTIONS: "openai-codex/gpt-5.4,opencode-go/glm-5.1",
+				},
+				modelOverride: { sessionConfig: { configId: "model", value: "openai-codex/gpt-5.6-sol" } },
+			}),
+		/does not advertise model "openai-codex\/gpt-5.6-sol"/,
+	);
+}
+
+{
+	await assert.rejects(
+		() =>
+			runFixture({
+				env: {
+					FAKE_ACP_SESSION_ID: "session-config-ambiguous",
+					FAKE_ACP_MODEL_OPTIONS: "deepseek/deepseek-v4-flash,opencode-go/deepseek-v4-flash",
+				},
+				modelOverride: { sessionConfig: { configId: "model", value: "deepseek-v4-flash" } },
+			}),
+		/pass a provider\/id/,
+	);
+}
+
+{
+	const { result, calls } = await runFixture({
+		env: {
+			FAKE_ACP_SESSION_ID: "session-config-exact",
+			FAKE_ACP_MODEL_OPTIONS: "openai-codex/gpt-5.4,opencode-go/glm-5.1",
+		},
+		modelOverride: { sessionConfig: { configId: "model", value: "gpt-5.4" } },
+	});
+	const setCall = calls.find((c) => c.method === "session/set_config_option")!;
+	assert.equal(setCall.value, "openai-codex/gpt-5.4", "bare id must resolve to the unique advertised provider/id");
+	assert.equal(result.stopReason, "end_turn");
+}
+
+{
+	const { calls } = await runFixture({
+		env: { FAKE_ACP_SESSION_ID: "no-session-config" },
+	});
+	assert.deepEqual(methodsOf(calls), ["initialize", "session/new", "session/prompt"]);
+	assert.equal(
+		calls.some((c) => c.method === "session/set_config_option"),
+		false,
+		"adapters without sessionConfig must not emit session/set_config_option",
+	);
+}
+
+{
+	const peek = resetLanePeekForTests();
+	const { result } = await runFixture({
+		env: { FAKE_ACP_USAGE: "1" },
+		peekKey: "peek-live",
+	});
+	const snap = peek.get("peek-live");
+	assert.ok(snap, "a successful turn must write a peek record");
+	assert.ok(snap.tools.some((t) => t.target === "echo tool" || t.name === "tool"), "peek must capture the fixture tool call");
+	assert.ok(snap.assistantSnippet.includes("echo:say hi"), "peek must keep the last assistant snippet");
+	assert.equal(snap.usage?.inputTokens, 100);
+	assert.equal(snap.usage?.outputTokens, 40);
+	assert.equal(snap.lastError, undefined);
+	assert.equal(result.stopReason, "end_turn");
+}
+
+{
+	const peek = resetLanePeekForTests();
+	let promptError: unknown;
+	try {
+		await runFixture({
+			env: { FAKE_ACP_PROMPT_ERROR: "Claude Code 2.1.220 does not support this model" },
+			peekKey: "peek-fail",
+		});
+	} catch (error) {
+		promptError = error;
+	}
+	assert.ok(promptError instanceof AcpTurnUncertainError, "a post-establish prompt error must taint the lane");
+	const msg = String((promptError as Error).message);
+	assert.match(msg, /ACP turn failed after session establishment/);
+	assert.match(msg, /Claude Code 2\.1\.220 does not support this model/);
+	assert.ok(!msg.includes("fake-fresh-session"), "failure text must still scrub the session id");
+	const snap = peek.get("peek-fail");
+	assert.ok(snap?.lastError, "peek must retain the verbatim last error after a failed turn");
+	assert.match(snap.lastError, /Claude Code 2\.1\.220 does not support this model/);
 }
 
 fs.rmSync(tmpBase, { recursive: true, force: true });

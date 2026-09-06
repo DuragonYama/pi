@@ -178,7 +178,7 @@ type SessionEntry = ReturnType<ExtensionContext["sessionManager"]["getEntries"]>
  *
  * Exported for the perf probe, not for other extensions.
  */
-export interface UsageSums {
+interface UsageSums {
 	input: number;
 	output: number;
 	cacheRead: number;
@@ -192,7 +192,7 @@ export interface UsageSums {
 	lastEntry: SessionEntry | undefined;
 }
 
-export function makeUsageSums(): UsageSums {
+function makeUsageSums(): UsageSums {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, cacheHit: null, lastLen: 0, lastEntry: undefined };
 }
 
@@ -236,9 +236,8 @@ function foldEntry(s: UsageSums, entry: SessionEntry): void {
  * Wrapped in try/catch: a render racing extension teardown must never crash
  * the TUI — it just draws nothing for one frame.
  *
- * Exported for the perf probe.
  */
-export function gather(ctx: ExtensionContext, footerData: ReadonlyFooterDataProvider, sums: UsageSums): BeamData | null {
+function gather(ctx: ExtensionContext, footerData: ReadonlyFooterDataProvider, sums: UsageSums): BeamData | null {
 	try {
 		const entries = ctx.sessionManager.getEntries();
 		const n = entries.length;

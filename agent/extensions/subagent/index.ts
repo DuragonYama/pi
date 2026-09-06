@@ -73,10 +73,12 @@ import {
 	type ContinuityMode,
 	type RunnerContinuity,
 } from "../acp-subagents/core.ts";
+import { formatLanePeek, getLanePeekStore } from "../acp-subagents/lane-peek.ts";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import {
 	BackgroundRunTracker,
 	buildNativeAgentArgs,
+	buildPersistentFollowUp,
 	canonicalizeCwd,
 	DEFAULT_STEP_TIMEOUT_SECONDS,
 	deriveNativeAffinityUuid,
@@ -441,6 +443,7 @@ async function runAcpStep(
 				def.trust ?? "default",
 				agentName,
 				isStale,
+				execution.laneKey ?? undefined,
 			)
 		: new AcpPolicyClient(
 				ctx,
@@ -448,6 +451,8 @@ async function runAcpStep(
 				execution.nonInteractive === true,
 				def.trust ?? "default",
 				agentName,
+				undefined,
+				execution.laneKey ?? undefined,
 			);
 
 	// Continuity is resolved deterministically against the in-memory lane
@@ -633,6 +638,7 @@ async function runAcpStep(
 			policy,
 			...(isStale ? { isStale } : {}),
 			...(execution.trackWorkerExit ? { trackWorkerExit: execution.trackWorkerExit } : {}),
+			...(execution.laneKey ? { peekKey: execution.laneKey } : {}),
 		});
 		const cumulative = result.usage;
 		const prev = result.sessionId ? acpSessionCumulative.get(result.sessionId) : undefined;
@@ -709,6 +715,20 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 	return items;
 }
 
+const liveTmpPromptDirs = new Set<string>();
+
+/** Best-effort sweep of native-child prompt temp dirs. SIGKILL of pi cannot run this. */
+function cleanupLiveTmpPromptDirs(): void {
+	for (const dir of [...liveTmpPromptDirs]) {
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+		} catch {
+			/* already gone */
+		}
+		liveTmpPromptDirs.delete(dir);
+	}
+}
+
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 	const safeName = agentName.replace(/[^\w.-]+/g, "_");
@@ -717,6 +737,7 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 		await withFileMutationQueue(filePath, async () => {
 			await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
 		});
+		liveTmpPromptDirs.add(tmpDir);
 		return { dir: tmpDir, filePath };
 	} catch (error) {
 		// Don't leak the temp dir if the write itself fails.
@@ -1187,6 +1208,8 @@ async function runSingleAgentInner(
 				fs.rmdirSync(tmpPromptDir);
 			} catch {
 				/* ignore */
+			} finally {
+				liveTmpPromptDirs.delete(tmpPromptDir);
 			}
 	}
 }
@@ -1286,8 +1309,10 @@ export default function (pi: ExtensionAPI) {
 	// Shared extension gate: without a non-empty epoch-file path, the runtime and
 	// input handler are not constructed and no new hook is registered.
 	const fleetEpochFile = process.env.PI_FLEET_EPOCH_FILE?.trim();
+	let rewriteNotify: ((msg: string) => void) | undefined;
 	const fleetEpochRuntime = fleetEpochFile ? new FleetEpochRuntime(fleetEpochFile) : undefined;
 	if (fleetEpochRuntime) {
+		fleetEpochRuntime.setOnRewrite((msg) => rewriteNotify?.(msg));
 		const handleFleetInput = createFleetInputHandler(fleetEpochRuntime, () =>
 			persistentAgents.all().map(({ name, harness, lastActiveAt, task, generation }) => ({
 				name,
@@ -1316,14 +1341,17 @@ export default function (pi: ExtensionAPI) {
 	// ACP lane registry: in-memory only, keyed through the parent Pi session ID.
 	// Lifecycle events drop records that cannot belong to the active session;
 	// nothing survives a Pi restart by design.
-	// Sizing defaults match core.ts's DEFAULT_* (32 lanes / 60-min idle / 24
-	// turns); a fleet profile raises them via env without forking core.ts. A
-	// persistent agent force-resumes by stored session id and bypasses idle/turn
-	// eviction anyway, so these mainly govern ephemeral lane churn.
+	// Production defaults 128 lanes / 240-min idle / 100 turns (core.ts's
+	// constructor defaults remain 32/60/24 for callers that omit options).
+	// Env-tunable without forking core.ts. A persistent agent force-resumes
+	// by stored session id and bypasses idle/turn eviction anyway, so these
+	// mainly govern ephemeral lane churn.
+	const peekStore = getLanePeekStore();
 	const laneRegistry = new AcpLaneRegistry({
 		maxEntries: envInt("PI_FLEET_MAX_LANES", 128, 4, 4096),
 		idleMs: envInt("PI_FLEET_LANE_IDLE_MIN", 240, 1, 10080) * 60_000,
 		maxTurns: envInt("PI_FLEET_LANE_MAX_TURNS", 100, 1, 10000),
+		onDrop: (key) => peekStore.drop(key),
 	});
 	// In-flight background delegations. Aborting one feeds the runners' existing
 	// SIGTERM→SIGKILL process-group kill path, so shutdown leaves no orphans.
@@ -1351,6 +1379,9 @@ export default function (pi: ExtensionAPI) {
 	// env-tunable — only this throughput budget is.
 	const MCP_MSGS_PER_TURN = envInt("PI_FLEET_MCP_MSGS_PER_TURN", 12, 1, 100);
 	pi.on("session_start", (_event, ctx) => {
+		rewriteNotify = (msg) => {
+			if (ctx.hasUI) ctx.ui.notify(msg, "info");
+		};
 		activeParentSessionId = ctx.sessionManager.getSessionId();
 		backgroundRuns.abortExceptParent(activeParentSessionId);
 		laneRegistry.clearExceptParent(activeParentSessionId);
@@ -1361,7 +1392,12 @@ export default function (pi: ExtensionAPI) {
 		persistentAgents.hydrate(activeParentSessionId);
 		// Persistent agents survive /reload (same parent, globalThis-pinned) but a
 		// genuinely new session drops the previous session's agents + orphan records.
-		for (const m of persistentAgents.clearExceptParent(activeParentSessionId)) registry.remove(m.loomId);
+		for (const m of persistentAgents.clearExceptParent(activeParentSessionId)) {
+			registry.remove(m.loomId);
+			commsRef?.revoke(m.loomId);
+			if (m.sessionId) acpSessionCumulative.delete(m.sessionId);
+		}
+		commsRef?.revokeExcept(persistentAgents.all().map((m) => m.loomId));
 		// The lane registry is rebuilt empty on /reload; re-seed it from the
 		// surviving persistent store so a /dm or persistent_agent message still
 		// resumes the stored session (continuity "auto") instead of starting fresh.
@@ -1379,7 +1415,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		backgroundRuns.abortAll();
 		laneRegistry.clear();
+		cleanupLiveTmpPromptDirs();
 	});
+	// Residual: SIGKILL of the pi process never runs session_shutdown or 'exit'.
+	process.on("exit", cleanupLiveTmpPromptDirs);
 
 	/**
 	 * Send a task to an EXISTING persistent agent by name, resuming its stored
@@ -1617,6 +1656,7 @@ export default function (pi: ExtensionAPI) {
 		inflightPersistent.get(meta.loomId)?.abort();
 		// Invalidate its comms token so a still-dying adapter can never route again.
 		commsRef?.revoke(meta.loomId);
+		if (meta.sessionId) acpSessionCumulative.delete(meta.sessionId);
 		// Drop the per-turn message-budget residue for this loomId.
 		mcpTurnCount.delete(meta.loomId);
 		// If no surviving agent shares this lane, forget the lane→session record so a
@@ -1625,6 +1665,7 @@ export default function (pi: ExtensionAPI) {
 		// co-located lanes; solo lanes are unique). removeByName already dropped meta.
 		if (!persistentAgents.all().some((m) => m.laneKey === meta.laneKey)) {
 			laneRegistry.invalidate(meta.laneKey);
+			peekStore.drop(meta.laneKey);
 		}
 		registry.remove(meta.loomId);
 		return meta.name;
@@ -1823,7 +1864,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "persistent_agent",
 		label: "Persistent Agent",
-		promptSnippet: "See, message, or dismiss your standing @-named workers (list/message/history/kill).",
+		promptSnippet: "See, message, peek, or dismiss your standing @-named workers (list/message/history/peek/kill).",
 		promptGuidelines: [
 			// Router-mode fix: state the worker-side capability as an invariant, then ban the relay.
 			"Persistent workers can message each other directly through their own message_agent tool. To make two standing workers converse, message ONE of them (persistent_agent action:\"message\") and tell IT to message_agent the other — never shuttle their replies back and forth yourself; hand-relaying worker-to-worker traffic is a bug, not a fallback.",
@@ -1831,13 +1872,19 @@ export default function (pi: ExtensionAPI) {
 		],
 		description: [
 			"See and control PERSISTENT sub-agents — the standing, directly-addressable workers created via subagent(persistent:true).",
-			"actions: 'list' (show every persistent agent with its @name, harness, and idle/busy status — call this to answer 'who do I have?' or before messaging one); 'message' (send {name, task} to an existing agent — this RESUMES its session and keeps its context, so ALWAYS use this to talk to a standing agent, never subagent, which would spawn a new one); 'history' (read {name}'s recent exchanges, including /dm messages the user sent it directly — use this to catch up on what an agent has been doing); 'kill' (dismiss {name}).",
+			"actions: 'list' (show every persistent agent with its @name, harness, and idle/busy status — call this to answer 'who do I have?' or before messaging one); 'message' (send {name, task} to an existing agent — this RESUMES its session and keeps its context, so ALWAYS use this to talk to a standing agent, never subagent, which would spawn a new one); 'history' (read {name}'s recent exchanges, including /dm messages the user sent it directly — use this to catch up on what an agent has been doing); 'peek' (live snapshot of what {name} is doing right now: recent tools, last assistant snippet, usage, last error — use this instead of scraping harness logs); 'kill' (dismiss {name}).",
 			"Persistent agents are addressed by their assigned @name (e.g. Onyx, Cyra), NOT by their harness (claude/cursor). The user can also /dm them directly from the TUI.",
 		].join(" "),
 		parameters: Type.Object({
-			action: StringEnum(["list", "message", "history", "kill"] as const, { description: "list | message | history | kill" }),
-			name: Type.Optional(Type.String({ description: "The persistent agent's @name (without the @). Required for message/history/kill." })),
+			action: StringEnum(["list", "message", "history", "kill", "peek"] as const, { description: "list | message | history | kill | peek" }),
+			name: Type.Optional(Type.String({ description: "The persistent agent's @name (without the @). Required for message/history/kill/peek." })),
 			task: Type.Optional(Type.String({ description: "The message/task to send. Required for message." })),
+			background: Type.Optional(
+				Type.Boolean({
+					description:
+						"message only. Default false (the tool waits for the worker's reply). When true, return immediately and deliver the reply later as a follow-up message.",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			ambientCtx = ctx; // freshest full context for comms-initiated resumes
@@ -1867,9 +1914,40 @@ export default function (pi: ExtensionAPI) {
 				const killed = killPersistent(params.name);
 				return asText(killed ? `Dismissed persistent agent @${killed}.` : `No persistent agent named "${params.name}".`);
 			}
+			if (params.action === "peek") {
+				if (!params.name) return asText("peek requires 'name'.");
+				const meta = persistentAgents.byName(params.name);
+				if (!meta) return asText(`No persistent agent named "${params.name}".`);
+				const rec = peekStore.get(meta.laneKey);
+				if (!rec) return asText(`@${meta.name} has no captured ACP activity yet.`);
+				const r = registry.get(meta.loomId);
+				const busy = r?.status === "running" || r?.status === "starting" || laneRegistry.isBusy(meta.laneKey);
+				return asText(formatLanePeek(rec, { name: meta.name, harness: meta.harness, busy }));
+			}
 			// message — reject-if-busy so it never blocks the orchestrator's turn,
 			// tagged owner:"orchestrator" so a user /dm! won't abort π's own turn.
 			if (!params.name || !params.task) return asText("message requires both 'name' and 'task'.");
+			if (params.background) {
+				const meta = persistentAgents.byName(params.name);
+				if (!meta) {
+					const roster = persistentAgents.all().map((m) => `@${m.name}`).join(", ") || "none";
+					return asText(`No persistent agent named "${params.name}". Current persistent agents: ${roster}.`);
+				}
+				const busy = agentGate.get(meta.loomId) !== undefined || isAgentBusy(meta.loomId, meta.laneKey);
+				if (busy) {
+					return asText(`Persistent agent @${meta.name} is busy right now. The user can /dm to queue behind it or /dm! to interrupt.`);
+				}
+				void messagePersistent(params.name, params.task, ctx, { busyMode: "reject", owner: "orchestrator" })
+					.then((r) => {
+						pi.sendUserMessage(buildPersistentFollowUp(r.name ?? params.name!, r), { deliverAs: "followUp" });
+					})
+					.catch((error) => {
+						if (ctx.hasUI) {
+							ctx.ui.notify(`@${params.name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+						}
+					});
+				return asText(`Sent to @${params.name} in the background; the reply will arrive as a follow-up.`);
+			}
 			const r = await messagePersistent(params.name, params.task, ctx, { busyMode: "reject", owner: "orchestrator", onUpdate });
 			if (r.error) return asText(r.error);
 			return asText(`@${r.name} replied:\n${r.text}`);
@@ -2153,6 +2231,8 @@ export default function (pi: ExtensionAPI) {
 			void messagePersistent(name, prompt, cctx, { busyMode, owner: "user" }).then((r) => {
 				const meta = persistentAgents.byName(name);
 				pi.appendEntry("dm-exchange", { name, harness: meta?.harness, prompt, text: r.text, error: r.error, origin: "user" });
+			}).catch((error) => {
+				cctx.ui.notify(`@${name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
 			});
 		}
 	};
@@ -2179,7 +2259,9 @@ export default function (pi: ExtensionAPI) {
 				// Submit-time plan card: show the routing before any hop runs (a chain is
 				// ≥2 hops by construction here). Store only what the renderer needs.
 				pi.appendEntry("dm-plan", { hops: parsed.map((h) => ({ target: h.target, prompt: h.prompt, attachPrev: h.attachPrev })) });
-				void runChain(parsed, cctx);
+				void runChain(parsed, cctx).catch((error) => {
+					cctx.ui.notify(`Chain failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				});
 				return;
 			}
 			return runDm(args, cctx, false);
@@ -2408,6 +2490,25 @@ export default function (pi: ExtensionAPI) {
 						}),
 					];
 				} else executions = [];
+				// Auto-lane unnamed fan-outs: tasks that omitted a lane (or sent
+				// the shared "default") used to bounce the WHOLE batch whenever
+				// one agent appeared twice. Mint a throwaway lane for later
+				// duplicates (resolveParallelAutoLanes). Minted lanes are
+				// random-unique and run with continuity "fresh". Inside this try
+				// so a busy-lane or bad-timeout throw from the re-plan becomes
+				// "Invalid parameters" instead of an uncaught rejection.
+				if (params.tasks && params.tasks.length > 0) {
+					const mintedLanes = resolveParallelAutoLanes(
+						params.tasks.map((task) => ({ agent: task.agent, lane: task.lane, continuity: task.continuity })),
+						executions.map((execution) => execution.laneKey),
+						(index, lane) => planStep({ ...params.tasks![index], lane, continuity: "fresh" }).laneKey,
+						(agent) => `${agent}-${randomBytes(4).toString("hex")}`,
+					);
+					for (let i = 0; i < mintedLanes.length; i++) {
+						const lane = mintedLanes[i];
+						if (lane !== null) executions[i] = planStep({ ...params.tasks![i], lane, continuity: "fresh" });
+					}
+				}
 			} catch (error) {
 				return {
 					content: [
@@ -2432,28 +2533,6 @@ export default function (pi: ExtensionAPI) {
 						],
 						details: makeDetails("parallel")([]),
 					};
-				// Auto-lane unnamed fan-outs: tasks that omitted a lane (or sent the
-				// shared "default") used to bounce the WHOLE batch whenever one agent
-				// appeared twice. Mint a throwaway lane for the later duplicates
-				// instead (resolveParallelAutoLanes — pure + tested). Minted lanes are
-				// random-unique and run with continuity "fresh": a stable label could
-				// resume an unrelated idle conversation (or collide with a later
-				// explicit lane), and a minted worker is by definition an independent
-				// one-off — addressable, resumable workers use EXPLICIT named lanes.
-				// Explicit lanes and continuity "require" are never rewritten, so a
-				// genuine explicit collision still rejects below.
-				{
-					const mintedLanes = resolveParallelAutoLanes(
-						params.tasks.map((task) => ({ agent: task.agent, lane: task.lane, continuity: task.continuity })),
-						executions.map((execution) => execution.laneKey),
-						(index, lane) => planStep({ ...params.tasks![index], lane, continuity: "fresh" }).laneKey,
-						(agent) => `${agent}-${randomBytes(4).toString("hex")}`,
-					);
-					for (let i = 0; i < mintedLanes.length; i++) {
-						const lane = mintedLanes[i];
-						if (lane !== null) executions[i] = planStep({ ...params.tasks![i], lane, continuity: "fresh" });
-					}
-				}
 				const laneRequests = executions.flatMap((execution, index) =>
 					execution.laneKey !== null
 						? [{ agent: params.tasks![index].agent, lane: execution.lane, laneKey: execution.laneKey }]
@@ -2621,6 +2700,7 @@ export default function (pi: ExtensionAPI) {
 						if (activeParentSessionId !== null && activeParentSessionId !== parentSessionId) return;
 						// Steer, not followUp: pings must inject at the next tool-call
 						// boundary while the agent is working, not queue until it settles.
+						if (ctx.hasUI) ctx.ui.notify("[subagent] injecting steer for background completion", "info");
 						pi.sendUserMessage(text, { deliverAs: "steer" });
 					},
 					onLeased: (tokens) => {

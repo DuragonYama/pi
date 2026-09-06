@@ -1,9 +1,9 @@
 {
-  "defaultModel": "Qwen3.8-27B-4bit",
-  "defaultProvider": "dflash2",
+  "defaultModel": "gpt-5.4",
+  "defaultProvider": "openai-codex",
   "defaultThinkingLevel": "medium",
   "theme": "loom",
-  "lastChangelogVersion": "0.84.2",
+  "lastChangelogVersion": "0.85.0",
   "packages": [
     "npm:pi-mcp-adapter"
   ]

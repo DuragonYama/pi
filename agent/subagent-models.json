@@ -1,0 +1,6 @@
+{
+  "scout": "deepseek/deepseek-v4-flash",
+  "planner": "deepseek/deepseek-v4-pro",
+  "reviewer": "openai-codex/gpt-5.6-sol",
+  "worker": "openai-codex/gpt-5.6-luna"
+}

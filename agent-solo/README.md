@@ -23,11 +23,13 @@ Bare `pi` still uses the orchestrator dir (`~/.pi/agent`).
   `~/.pi/agent/extensions/`, so a fix to a shared extension reaches both profiles:
   - included: `bash-guard`, `dirty-repo-guard`, `git-checkpoint`, `session-name`,
     `steer-queue` (`/steer` `/queue`), `bg-command` (`/bg`), `web-tools`
-    (web search/fetch), and `shared/` (leaf helpers those need).
+    (web search/fetch), `usage` (`/usage` dashboard), and `shared/` (leaf
+    helpers those need). `shared/bg.ts` redacts via `shared/redact.ts` — it
+    does not import the orchestrator ACP layer.
   - excluded (the orchestration layer): `subagent`, `acp-subagents`,
     `agent-monitor` (Loom), `beam` (Loomstate footer).
 
-## Not tracked (see `.gitignore`)
+## Not tracked (see the repo-root `.gitignore`)
 
 `auth.json` / `models.json` / `models-store.json` are symlinks into `~/.pi/agent`
 (shared login + model catalog; `auth.json` holds secrets) — machine-local, never

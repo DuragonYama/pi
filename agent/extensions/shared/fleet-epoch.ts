@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { truncateUtf8 } from "./utf8.ts";
 
 export const FLEET_ENGAGEMENT_MARKER = "\u0001OFA_ENGAGEMENT";
 
@@ -114,21 +115,6 @@ function splitEnvelope(text: string): { envelope: EngagementEnvelope; prompt: st
 	return { envelope, prompt: newline === -1 ? "" : text.slice(newline + 1) };
 }
 
-function truncateUtf8(text: string, maxBytes: number): string {
-	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-	const marker = "…";
-	const target = Math.max(0, maxBytes - Buffer.byteLength(marker, "utf8"));
-	let out = "";
-	let bytes = 0;
-	for (const char of text) {
-		const size = Buffer.byteLength(char, "utf8");
-		if (bytes + size > target) break;
-		out += char;
-		bytes += size;
-	}
-	return `${out}${marker}`;
-}
-
 function taskPreview(task: string | undefined): string {
 	if (!task) return "-";
 	const compact = task.replace(/\s+/g, " ").trim();
@@ -161,6 +147,7 @@ function identityStanza(envelope: EngagementEnvelope, workers: FleetRosterWorker
 export class FleetEpochRuntime {
 	readonly file: string;
 	private readonly cacheMs: number;
+	private onRewrite?: (msg: string) => void;
 	private cache: { checkedAt: number; mtimeMs: number | null; record: FleetEpochRecord | null } | undefined;
 	private accepted: number | undefined;
 	private turnGeneration: number | undefined;
@@ -169,6 +156,19 @@ export class FleetEpochRuntime {
 		this.file = file;
 		this.cacheMs = options.cacheMs ?? DEFAULT_CACHE_MS;
 		this.currentFileEpoch();
+	}
+
+	/** Wire a one-line signal for silent task/RPC rewrites (ui.notify in production). */
+	setOnRewrite(callback: (msg: string) => void): void {
+		this.onRewrite = callback;
+	}
+
+	noteRewrite(msg: string): void {
+		try {
+			this.onRewrite?.(msg);
+		} catch {
+			/* notify must never break a stamp or input transform */
+		}
 	}
 
 	currentFileEpoch(now = Date.now()): FleetEpochRecord | null {
@@ -274,7 +274,9 @@ export class FleetEpochRuntime {
 	}
 
 	stampTask(task: string, generation: number | undefined): string {
-		return generation === undefined ? task : `[gen ${generation}]\n${task}`;
+		if (generation === undefined) return task;
+		this.noteRewrite(`[fleet] stamped task with [gen ${generation}]`);
+		return `[gen ${generation}]\n${task}`;
 	}
 }
 
@@ -436,6 +438,7 @@ export function createFleetInputHandler(
 			if (event.streamingBehavior === "steer") return { action: "continue" };
 			const parsed = await runtime.acceptEnvelope(event.text);
 			if (!parsed) return { action: "continue" };
+			runtime.noteRewrite("[fleet] RPC input transformed (identity stanza)");
 			return {
 				action: "transform",
 				text: `${identityStanza(parsed.envelope, workers(), now())}\n\n${parsed.prompt}`,

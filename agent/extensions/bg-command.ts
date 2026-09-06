@@ -28,6 +28,7 @@ import {
 	bgDangerReason,
 	finishBgJob,
 	getRunningLogPaths,
+	killBgJob,
 	pruneExitedJobs,
 	readBgLogTail,
 	rotateBgLogs,
@@ -66,8 +67,9 @@ export default function (pi: ExtensionAPI) {
 		}
 		pruneExitedJobs(jobs);
 
-		const failPing = (text: string) => {
+		const failPing = (text: string, jobId: string) => {
 			try {
+				if (ctx.hasUI) ctx.ui.notify(`[bg] injecting steer completion for job ${jobId}`, "info");
 				// Steer, not followUp: pings must inject at the next tool-call
 				// boundary while the agent is working, not queue until it settles.
 				pi.sendUserMessage(text, { deliverAs: "steer" });
@@ -85,12 +87,12 @@ export default function (pi: ExtensionAPI) {
 				// the returned tail feeds the ping (never empty on write failure).
 				const tail = truncateBgLog(logPath) ?? readBgLogTail(logPath);
 				rotateBgLogs(BG_LOG_DIR, getRunningLogPaths(jobs), MAX_BG_LOG_FILES);
-				failPing(buildBgPing({ id: started.id, command, logPath }, code, tail));
+				failPing(buildBgPing({ id: started.id, command, logPath }, code, tail), started.id);
 			},
 			onError: (message, logPath) => {
 				finishBgJob(jobs, logPath, null);
 				rotateBgLogs(BG_LOG_DIR, getRunningLogPaths(jobs), MAX_BG_LOG_FILES);
-				failPing(`[bg] Job ${started.id} failed to start: ${message}`);
+				failPing(`[bg] Job ${started.id} failed to start: ${message}`, started.id);
 			},
 		});
 
@@ -101,6 +103,7 @@ export default function (pi: ExtensionAPI) {
 			startedAt: Date.now(),
 			state: "running",
 			exit: null,
+			pid: started.pid,
 		});
 		rotateBgLogs(BG_LOG_DIR, getRunningLogPaths(jobs), MAX_BG_LOG_FILES);
 		return { ok: true, id: started.id, pid: started.pid, logPath: started.logPath };
@@ -136,10 +139,36 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	const bgHelp =
+		"Usage: /bg  or  /bg kill <id>\n" +
+		"/bg kill <id> sends SIGTERM to the job's process group.\n" +
+		"Jobs run via /bin/bash -lc (login shell — sources your rc files).";
+
+	pi.on("session_start", () => {
+		rotateBgLogs(BG_LOG_DIR, getRunningLogPaths(jobs), MAX_BG_LOG_FILES);
+	});
+
 	pi.registerCommand("bg", {
-		description: "List background jobs started in this session (/bg)",
-		handler: async (_args, ctx) => {
-			ctx.ui.notify(buildBgList([...jobs.values()]), "info");
+		description: "List session background jobs, or /bg kill <id>. Jobs use bash -lc (login shell).",
+		handler: async (args, ctx) => {
+			const trimmed = args.trim();
+			const killMatch = /^kill(?:\s+(\S+))?/.exec(trimmed);
+			if (killMatch) {
+				const id = killMatch[1];
+				if (!id) {
+					ctx.ui.notify(bgHelp, "info");
+					return;
+				}
+				const result = killBgJob(jobs, id);
+				if (result.ok === false) {
+					ctx.ui.notify(result.reason, "warning");
+					return;
+				}
+				rotateBgLogs(BG_LOG_DIR, getRunningLogPaths(jobs), MAX_BG_LOG_FILES);
+				ctx.ui.notify(`Sent SIGTERM to job ${id} (pgid ${result.job.pid ?? "?"}).`, "info");
+				return;
+			}
+			ctx.ui.notify(`${buildBgList([...jobs.values()])}\n\n${bgHelp}`, "info");
 		},
 	});
 }

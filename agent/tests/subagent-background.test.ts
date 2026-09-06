@@ -536,6 +536,8 @@ for (const mixed of [
 	assert.ok(indexSource.includes("createFleetExitGate"), "background fleet registration must track worker process exit");
 	assert.ok(indexSource.includes("trackWorkerExit"), "inner background steps must bind the shared process-exit gate");
 	assert.ok(indexSource.includes('deliverAs: "steer"'), "pings must be delivered as steer messages (inject mid-turn, not queued)");
+	assert.ok(indexSource.includes("buildPersistentFollowUp"), "persistent_agent background must use the shared follow-up helper");
+	assert.ok(indexSource.includes('deliverAs: "followUp"'), "persistent_agent background replies must be followUp (queued), not steer");
 	assert.ok(indexSource.includes("isBusy"), "planning must reject requests on busy lanes before spawning");
 	assert.ok(indexSource.includes("laneBusyError"), "busy-lane rejections must use the actionable error");
 	assert.ok(

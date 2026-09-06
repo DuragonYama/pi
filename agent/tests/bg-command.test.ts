@@ -13,6 +13,7 @@ import {
 	buildBgPing,
 	finishBgJob,
 	getRunningLogPaths,
+	killBgJob,
 	MAX_ACTIVE_BG_JOBS,
 	newJobId,
 	pruneExitedJobs,
@@ -66,7 +67,7 @@ const list = buildBgList([
 	{ id: "a", command: "make build", logPath: "/tmp/a.log", startedAt: 1, state: "running", exit: null },
 	{ id: "b", command: "npm test", logPath: "/tmp/b.log", startedAt: 2, state: "exited", exit: 0 },
 ]);
-assert.match(list, /1 running, 1 finished/);
+assert.match(list, /1 running, 1 finished, 0 killed/);
 assert.match(list, /\[running\] a:/);
 assert.match(list, /\[exited 0\] b:/);
 assert.match(buildBgList([]), /No background jobs/);
@@ -258,5 +259,96 @@ completing.set("running", { id: "running", command: "x", logPath: "/tmp/running.
 finishBgJob(completing, "/tmp/running.log", 0);
 assert.equal([...completing.values()].filter((entry) => entry.state === "exited").length, 20);
 assert.deepEqual([...getRunningLogPaths(completing)], [], "only genuinely running logs may be rotation-exempt");
+
+// --- killBgJob: SIGTERM the process group, mark killed, wait for exit ---
+{
+	const jobs = new Map<string, BgJob>();
+	const exited = new Promise<{ code: number | null; logPath: string }>((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("killed sleep job did not exit")), 10_000);
+		const started = startBgJob({
+			command: "sleep 30",
+			cwd: process.cwd(),
+			onExit: (code, logPath) => {
+				clearTimeout(timeout);
+				finishBgJob(jobs, logPath, code);
+				resolve({ code, logPath });
+			},
+			onError: (message) => {
+				clearTimeout(timeout);
+				reject(new Error(`unexpected kill-test spawn error: ${message}`));
+			},
+		});
+		jobs.set(started.id, {
+			id: started.id,
+			command: "sleep 30",
+			logPath: started.logPath,
+			startedAt: Date.now(),
+			state: "running",
+			exit: null,
+			pid: started.pid,
+		});
+		const result = killBgJob(jobs, started.id);
+		assert.equal(result.ok, true, "kill of a live sleep job must succeed");
+		assert.equal(jobs.get(started.id)?.state, "killed");
+	});
+	const finished = await exited;
+	const job = [...jobs.values()].find((entry) => entry.logPath === finished.logPath);
+	assert.ok(job, "killed job must remain in the registry until prune");
+	assert.equal(job.state, "killed", "finishBgJob must not clobber the killed mark");
+	assert.ok(job.exit !== undefined, "killed job must record an exit code");
+	assert.match(buildBgList([...jobs.values()]), /1 killed/);
+}
+
+{
+	const already = new Map<string, BgJob>();
+	already.set("done-1", {
+		id: "done-1",
+		command: "echo hi",
+		logPath: "/tmp/done-1.log",
+		startedAt: 1,
+		state: "exited",
+		exit: 0,
+		pid: 1,
+	});
+	const rejected = killBgJob(already, "done-1");
+	assert.equal(rejected.ok, false, "kill of an already-finished job must be rejected");
+}
+
+// Kill-vs-natural-exit interleaving is not exercised: a true race (OS exit
+// before the JS exit handler / finishBgJob transition) is timing-flaky and
+// would violate the deterministic gate. The block below only asserts the
+// terminal-state rejection after the exit callback has fully settled.
+{
+	const jobs = new Map<string, BgJob>();
+	await new Promise<void>((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("natural-exit job did not finish")), 10_000);
+		const started = startBgJob({
+			command: "true",
+			cwd: process.cwd(),
+			onExit: (code, logPath) => {
+				clearTimeout(timeout);
+				finishBgJob(jobs, logPath, code);
+				resolve();
+			},
+			onError: (message) => {
+				clearTimeout(timeout);
+				reject(new Error(`unexpected natural-exit error: ${message}`));
+			},
+		});
+		jobs.set(started.id, {
+			id: started.id,
+			command: "true",
+			logPath: started.logPath,
+			startedAt: Date.now(),
+			state: "running",
+			exit: null,
+			pid: started.pid,
+		});
+	});
+	const id = [...jobs.keys()][0]!;
+	const afterExit = killBgJob(jobs, id);
+	assert.equal(afterExit.ok, false, "kill after a natural exit must not treat the job as running");
+	assert.equal(jobs.get(id)?.state, "exited");
+}
 
 console.log("ALL BG-COMMAND TESTS PASSED");

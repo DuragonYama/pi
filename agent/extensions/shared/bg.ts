@@ -5,12 +5,14 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, mkdirSync, openSync, readdirSync, readSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readdirSync, readSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { redactSecrets } from "../acp-subagents/core.ts";
 import { findDangerous } from "./danger.ts";
 import { agentDir, envInt } from "./env-config.ts";
+import { redactSecrets } from "./redact.ts";
+import { utf8HeadWithin, utf8TailWithin } from "./utf8.ts";
+import { writeAll } from "./write-all.mjs";
 
 // Resolved from the active profile dir (PI_CODING_AGENT_DIR-aware) so a copied
 // profile writes its own bg-logs instead of a ~/.pi/agent that may not exist.
@@ -33,25 +35,10 @@ export interface BgJob {
 	command: string;
 	logPath: string;
 	startedAt: number;
-	state: "running" | "exited";
+	state: "running" | "exited" | "killed";
 	exit: number | null;
-}
-
-function utf8TailWithin(text: string, maxBytes: number): string {
-	const bytes = Buffer.from(text, "utf8");
-	if (bytes.length <= maxBytes) return text;
-	let start = bytes.length - maxBytes;
-	while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++;
-	return bytes.subarray(start).toString("utf8");
-}
-
-function utf8HeadWithin(text: string, maxBytes: number): string {
-	if (maxBytes <= 0) return "";
-	const bytes = Buffer.from(text, "utf8");
-	if (bytes.length <= maxBytes) return text;
-	let end = maxBytes;
-	while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
-	return bytes.subarray(0, end).toString("utf8");
+	/** Process-group leader pid (detached spawn). Absent only if spawn never reported one. */
+	pid?: number;
 }
 
 /** Timestamp + random suffix: collision-resistant even for sibling starts in the same second. */
@@ -88,12 +75,14 @@ export function buildBgList(jobs: readonly BgJob[], maxShown = MAX_RETAINED_BG_H
 	if (jobs.length === 0) return "No background jobs in this session. Use bg_run to start one.";
 	const running = jobs.filter((j) => j.state === "running");
 	const exited = jobs.filter((j) => j.state === "exited");
+	const killed = jobs.filter((j) => j.state === "killed");
 	const lines = [
-		`Background jobs: ${running.length} running, ${exited.length} finished.`,
+		`Background jobs: ${running.length} running, ${exited.length} finished, ${killed.length} killed.`,
 		...running.slice(0, maxShown).map((j) => `[running] ${j.id}: ${j.command.slice(0, 80)} (log: ${j.logPath})`),
 		...exited.slice(-maxShown).map((j) => `[exited ${j.exit}] ${j.id}: ${j.command.slice(0, 80)} (log: ${j.logPath})`),
+		...killed.slice(-maxShown).map((j) => `[killed ${j.exit ?? "sig"}] ${j.id}: ${j.command.slice(0, 80)} (log: ${j.logPath})`),
 	];
-	const shown = Math.min(running.length, maxShown) + Math.min(exited.length, maxShown);
+	const shown = Math.min(running.length, maxShown) + Math.min(exited.length, maxShown) + Math.min(killed.length, maxShown);
 	const omitted = jobs.length - shown;
 	if (omitted > 0) lines.push(`... ${omitted} more job${omitted === 1 ? "" : "s"} omitted.`);
 	return lines.join("\n");
@@ -128,11 +117,11 @@ export function rotateBgLogs(dir: string, activePaths: ReadonlySet<string>, maxF
 
 /** Prune exited job records beyond the retained-history cap (oldest first). */
 export function pruneExitedJobs(jobs: Map<string, BgJob>, maxRetained = MAX_RETAINED_BG_HISTORY): void {
-	const exited = [...jobs.values()].filter((j) => j.state === "exited");
-	if (exited.length <= maxRetained) return;
-	exited
+	const terminal = [...jobs.values()].filter((j) => j.state === "exited" || j.state === "killed");
+	if (terminal.length <= maxRetained) return;
+	terminal
 		.sort((a, b) => a.startedAt - b.startedAt)
-		.slice(0, exited.length - maxRetained)
+		.slice(0, terminal.length - maxRetained)
 		.forEach((job) => jobs.delete(job.id));
 }
 
@@ -140,11 +129,39 @@ export function pruneExitedJobs(jobs: Map<string, BgJob>, maxRetained = MAX_RETA
 export function finishBgJob(jobs: Map<string, BgJob>, logPath: string, exit: number | null): void {
 	for (const job of jobs.values()) {
 		if (job.logPath !== logPath) continue;
-		job.state = "exited";
+		if (job.state === "running") job.state = "exited";
 		job.exit = exit;
 		break;
 	}
 	pruneExitedJobs(jobs);
+}
+
+/**
+ * SIGTERM the detached process group recorded at spawn, then mark the job
+ * killed. Rotation treats killed jobs as terminal (their logs are not exempt).
+ * ESRCH (already gone) still marks killed — the exit handler will fill `exit`.
+ */
+export function killBgJob(
+	jobs: Map<string, BgJob>,
+	id: string,
+): { ok: true; job: BgJob } | { ok: false; reason: string } {
+	const job = jobs.get(id);
+	if (!job) return { ok: false, reason: `No background job "${id}" in this session.` };
+	if (job.state !== "running") return { ok: false, reason: `Job ${id} is already ${job.state}.` };
+	if (job.pid === undefined) return { ok: false, reason: `Job ${id} has no recorded process group.` };
+	try {
+		process.kill(-job.pid, "SIGTERM");
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code !== "ESRCH") {
+			return {
+				ok: false,
+				reason: `Could not signal job ${id}: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
+	job.state = "killed";
+	return { ok: true, job };
 }
 
 /** Only genuinely running logs are exempt from rotation. */
@@ -231,12 +248,6 @@ export function truncateBgLog(logPath: string, maxBytes = BG_LOG_TRUNCATE_BYTES)
 	}
 }
 
-function writeAll(fd: number, buffer: Buffer): void {
-	let offset = 0;
-	while (offset < buffer.length) {
-		offset += writeSync(fd, buffer, offset, buffer.length - offset);
-	}
-}
 
 export interface StartedBgJob {
 	id: string;

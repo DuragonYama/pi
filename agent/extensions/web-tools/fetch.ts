@@ -288,8 +288,22 @@ async function fetchWebPageDirect(normalizedUrl: string, signal?: AbortSignal): 
 	return response;
 }
 
+/** Opt-in only. Default OFF so page URLs are not shared with r.jina.ai. */
+export function jinaFallbackEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	const value = env.PI_WEB_JINA_FALLBACK?.trim().toLowerCase();
+	return value === "1" || value === "true" || value === "yes";
+}
+
+/** Share the origin+path only — never query or fragment — with r.jina.ai. */
+export function urlForJina(normalizedUrl: string): string {
+	const url = new URL(normalizedUrl);
+	url.search = "";
+	url.hash = "";
+	return `https://r.jina.ai/${url.href}`;
+}
+
 async function fetchWebPageViaJina(normalizedUrl: string, signal?: AbortSignal): Promise<PageResponse> {
-	const jinaUrl = `https://r.jina.ai/${normalizedUrl}`;
+	const jinaUrl = urlForJina(normalizedUrl);
 	const resource = await fetchPublicResource(jinaUrl, {
 		signal,
 		timeoutMs: 30_000,
@@ -317,7 +331,11 @@ async function fetchWebPageViaJina(normalizedUrl: string, signal?: AbortSignal):
 	};
 }
 
-export async function fetchWebPage(rawUrl: string, signal?: AbortSignal): Promise<PageResponse> {
+export async function fetchWebPage(
+	rawUrl: string,
+	signal?: AbortSignal,
+	hooks?: { onJina?: (sharedUrl: string) => void },
+): Promise<PageResponse> {
 	let normalizedUrl: string;
 	try {
 		normalizedUrl = new URL(rawUrl).href;
@@ -335,6 +353,11 @@ export async function fetchWebPage(rawUrl: string, signal?: AbortSignal): Promis
 		response = await fetchWebPageDirect(normalizedUrl, signal);
 	} catch (directError) {
 		if (signal?.aborted) throw directError;
+		if (!jinaFallbackEnabled()) {
+			throw new Error(`Could not extract the web page directly (${errorMessage(directError)})`);
+		}
+		const sharedUrl = urlForJina(normalizedUrl);
+		hooks?.onJina?.(sharedUrl);
 		try {
 			response = await fetchWebPageViaJina(normalizedUrl, signal);
 		} catch (jinaError) {

@@ -153,6 +153,19 @@ try {
 	assert.ok(gatedRoster, "the active project roster must contain the gated worker");
 	assert.match(readFileSync(gatedRoster!, "utf8"), /"generation": 8/, "gated roster serialization gains generation");
 
+	{
+		const { agentDir } = await import("../extensions/shared/env-config.ts");
+		const { homedir } = await import("node:os");
+		const prev = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = "~/profile-x";
+		assert.equal(agentDir(), join(homedir(), "profile-x"), "~/ expands to $HOME");
+		process.env.PI_CODING_AGENT_DIR = "~";
+		assert.equal(agentDir(), homedir(), "bare ~ expands to $HOME");
+		process.env.PI_CODING_AGENT_DIR = "~omer/x";
+		assert.equal(agentDir(), "~omer/x", "~user/… is left literal");
+		process.env.PI_CODING_AGENT_DIR = prev;
+	}
+
 	console.log("ALL PERSISTENT-AGENTS TESTS PASSED");
 } finally {
 	delete process.env.PI_FLEET_EPOCH_FILE;

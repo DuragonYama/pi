@@ -2,11 +2,22 @@ import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { Transform } from "node:stream";
 
+export interface SessionConfigOverride {
+	configId: string;
+	value: string;
+}
+
 export interface ModelOverrideConfig {
 	env?: Record<string, string>;
 	envJson?: Record<string, unknown>;
 	args?: string[];
 	argsPosition?: "prepend" | "append";
+	/**
+	 * After session/new or session/load, call ACP `session/set_config_option`
+	 * with this configId and the substituted value. Used by adapters that
+	 * create sessions in-process (e.g. pi-acp) and have no spawn-time model hook.
+	 */
+	sessionConfig?: SessionConfigOverride;
 }
 
 /**
@@ -35,13 +46,7 @@ export interface AgentConfig {
 	agents: Record<string, AgentDef>;
 }
 
-export function appendBoundedUtf8(current: string, chunk: string, maxBytes: number): string {
-	const combined = Buffer.from(current + chunk, "utf8");
-	if (combined.length <= maxBytes) return combined.toString("utf8");
-	let start = combined.length - maxBytes;
-	while (start < combined.length && (combined[start] & 0xc0) === 0x80) start++;
-	return combined.subarray(start).toString("utf8");
-}
+export { appendBoundedUtf8 } from "../shared/utf8.ts";
 
 /** Reject an NDJSON line before a downstream parser can retain it unbounded. */
 export function createBoundedLineTransform(maxLineBytes: number): Transform {
@@ -61,16 +66,7 @@ export function createBoundedLineTransform(maxLineBytes: number): Transform {
 	});
 }
 
-/** Redact common credential forms before policy metadata reaches disk. */
-export function redactSecrets(text: string): string {
-	return text
-		.replace(/([?&](?:token|key|secret|password|auth|api[_-]?key|sig|signature)=)[^&\s"']*/gi, "$1REDACTED")
-		.replace(/(https?:\/\/[^\s/@]+):[^\s/@]*@/gi, "$1:REDACTED@")
-		.replace(/((?:authorization|api[_-]?key|x-[a-z-]*key|token)["']?\s*[:=]\s*["']?)(?:Bearer\s+)?[^\s"']+(?:\s+[^\s"']+)?/gi, "$1REDACTED")
-		.replace(/(--(?:password|passwd|token|secret|api[_-]?key)\s+)(?:"[^"]*"|'[^']*'|\S+)/gi, "$1REDACTED")
-		.replace(/(\s-p\s+)(?:"[^"]*"|'[^']*'|\S+)/gi, "$1REDACTED")
-		.replace(/((?:api[_-]?key|token|secret|password)=)(?:"[^"]*"|'[^']*'|\S+)/gi, "$1REDACTED");
-}
+export { redactSecrets } from "../shared/redact.ts";
 
 function configError(message: string): never {
 	throw new Error(`Invalid ACP config: ${message}`);
@@ -112,7 +108,62 @@ function parseJsonRecord(value: unknown, field: string): Record<string, unknown>
 	return structuredClone(value);
 }
 
-function parseAgentDef(name: string, value: unknown): AgentDef {
+function parseSessionConfigOverride(value: unknown, field: string): SessionConfigOverride | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) configError(`${field} must be an object`);
+	if (typeof value.configId !== "string" || value.configId.trim() === "") {
+		configError(`${field}.configId must be a non-empty string`);
+	}
+	if (typeof value.value !== "string" || !value.value.includes("{model}")) {
+		configError(`${field}.value must be a string containing "{model}"`);
+	}
+	return { configId: value.configId, value: value.value };
+}
+
+export type AcpConfigWarning = (message: string) => void;
+
+/**
+ * Parse one adapter's modelOverride. Shape problems are NOT thrown: a future
+ * or stale runner must not take down the whole ACP fleet. Callers drop the
+ * override and warn; requesting a model then fails per-adapter.
+ */
+function parseModelOverride(name: string, raw: unknown): { override?: ModelOverrideConfig; warning?: string } {
+	try {
+		if (!isRecord(raw)) {
+			return { warning: `agents.${name}.modelOverride must be an object` };
+		}
+		const argsPosition = raw.argsPosition;
+		if (argsPosition !== undefined && argsPosition !== "prepend" && argsPosition !== "append") {
+			return { warning: `agents.${name}.modelOverride.argsPosition must be "prepend" or "append"` };
+		}
+		const override: ModelOverrideConfig = {
+			env: parseStringRecord(raw.env, `agents.${name}.modelOverride.env`),
+			envJson: parseJsonRecord(raw.envJson, `agents.${name}.modelOverride.envJson`),
+			args: parseStringArray(raw.args, `agents.${name}.modelOverride.args`),
+			argsPosition: argsPosition as "prepend" | "append" | undefined,
+			sessionConfig: parseSessionConfigOverride(raw.sessionConfig, `agents.${name}.modelOverride.sessionConfig`),
+		};
+		if (!override.env && !override.envJson && !override.args && !override.sessionConfig) {
+			return { warning: `agents.${name}.modelOverride must declare env, envJson, args, or sessionConfig templates` };
+		}
+		if (countModelPlaceholders(override) === 0) {
+			return { warning: `agents.${name}.modelOverride must contain at least one {model} placeholder` };
+		}
+		for (const [key, template] of Object.entries(override.env ?? {})) {
+			if (template !== "{model}") {
+				return {
+					warning: `agents.${name}.modelOverride.env.${key} must equal "{model}"; use envJson for structured values`,
+				};
+			}
+		}
+		return { override };
+	} catch (error) {
+		const detail = error instanceof Error ? error.message.replace(/^Invalid ACP config: /, "") : String(error);
+		return { warning: detail };
+	}
+}
+
+function parseAgentDef(name: string, value: unknown, onWarning?: AcpConfigWarning): AgentDef {
 	if (!isRecord(value)) configError(`agents.${name} must be an object`);
 	if (typeof value.command !== "string" || value.command.trim() === "") {
 		configError(`agents.${name}.command must be a non-empty string`);
@@ -125,28 +176,13 @@ function parseAgentDef(name: string, value: unknown): AgentDef {
 
 	let modelOverride: ModelOverrideConfig | undefined;
 	if (value.modelOverride !== undefined) {
-		if (!isRecord(value.modelOverride)) configError(`agents.${name}.modelOverride must be an object`);
-		const argsPosition = value.modelOverride.argsPosition;
-		if (argsPosition !== undefined && argsPosition !== "prepend" && argsPosition !== "append") {
-			configError(`agents.${name}.modelOverride.argsPosition must be "prepend" or "append"`);
+		const parsed = parseModelOverride(name, value.modelOverride);
+		if (parsed.warning) {
+			onWarning?.(
+				`${parsed.warning}; model overrides unavailable for this adapter (spawns still work on its default model)`,
+			);
 		}
-		modelOverride = {
-			env: parseStringRecord(value.modelOverride.env, `agents.${name}.modelOverride.env`),
-			envJson: parseJsonRecord(value.modelOverride.envJson, `agents.${name}.modelOverride.envJson`),
-			args: parseStringArray(value.modelOverride.args, `agents.${name}.modelOverride.args`),
-			argsPosition: argsPosition as "prepend" | "append" | undefined,
-		};
-		if (!modelOverride.env && !modelOverride.envJson && !modelOverride.args) {
-			configError(`agents.${name}.modelOverride must declare env, envJson, or args templates`);
-		}
-		if (countModelPlaceholders(modelOverride) === 0) {
-			configError(`agents.${name}.modelOverride must contain at least one {model} placeholder`);
-		}
-		for (const [key, template] of Object.entries(modelOverride.env ?? {})) {
-			if (template !== "{model}") {
-				configError(`agents.${name}.modelOverride.env.${key} must equal "{model}"; use envJson for structured values`);
-			}
-		}
+		modelOverride = parsed.override;
 	}
 
 	let trust: AgentTrust | undefined;
@@ -179,12 +215,12 @@ export function requiresAcpConfig(
 	return false;
 }
 
-export function parseAgentConfig(value: unknown): AgentConfig {
+export function parseAgentConfig(value: unknown, onWarning?: AcpConfigWarning): AgentConfig {
 	if (!isRecord(value) || !isRecord(value.agents)) configError("top-level agents must be an object");
 	const agents: Record<string, AgentDef> = {};
 	for (const [name, definition] of Object.entries(value.agents)) {
 		if (name.trim() === "") configError("agent names must not be empty");
-		agents[name] = parseAgentDef(name, definition);
+		agents[name] = parseAgentDef(name, definition, onWarning);
 	}
 	if (Object.keys(agents).length === 0) configError("at least one agent must be configured");
 	return { agents };
@@ -347,6 +383,12 @@ export interface AcpLaneRegistryOptions {
 	idleMs?: number;
 	maxTurns?: number;
 	now?: () => number;
+	/**
+	 * Fired when a lane record actually leaves the map (idle expire, LRU
+	 * evict, parent-clear, clear). Same-key re-register and invalidate do
+	 * NOT fire — peek must keep the last error after a tainted turn.
+	 */
+	onDrop?: (laneKey: string) => void;
 }
 
 interface StoredLaneRecord extends AcpLaneRecord {
@@ -371,12 +413,21 @@ export class AcpLaneRegistry {
 	private readonly idleMs: number;
 	private readonly maxTurns: number;
 	private readonly now: () => number;
+	private readonly onDrop?: (laneKey: string) => void;
 
 	constructor(options: AcpLaneRegistryOptions = {}) {
 		this.maxEntries = options.maxEntries ?? DEFAULT_MAX_LANES;
 		this.idleMs = options.idleMs ?? DEFAULT_LANE_IDLE_MS;
 		this.maxTurns = options.maxTurns ?? DEFAULT_LANE_MAX_TURNS;
 		this.now = options.now ?? Date.now;
+		this.onDrop = options.onDrop;
+	}
+
+	/** Delete a lane that is gone for good and notify peek. */
+	private forget(laneKey: string): void {
+		if (!this.lanes.has(laneKey)) return;
+		this.lanes.delete(laneKey);
+		this.onDrop?.(laneKey);
 	}
 
 	private isExpired(record: StoredLaneRecord): boolean {
@@ -390,7 +441,7 @@ export class AcpLaneRegistry {
 			return mode === "require" ? { action: "unavailable", reason: "no-lane" } : { action: "fresh" };
 		}
 		if (this.isExpired(record)) {
-			this.lanes.delete(laneKey);
+			this.forget(laneKey);
 			return mode === "require" ? { action: "unavailable", reason: "idle" } : { action: "rotated", reason: "idle" };
 		}
 		if (record.turns >= this.maxTurns || record.attempts >= this.maxTurns * 2) {
@@ -404,7 +455,7 @@ export class AcpLaneRegistry {
 		const at = this.now();
 		this.lanes.delete(laneKey);
 		for (const [key, record] of this.lanes) {
-			if (this.isExpired(record)) this.lanes.delete(key);
+			if (this.isExpired(record)) this.forget(key);
 		}
 		// Prompt attempts are recorded only by onPromptSubmitted. Registration
 		// can happen before a prompt and must not pre-count launch/setup work.
@@ -419,7 +470,7 @@ export class AcpLaneRegistry {
 				}
 			}
 			if (lruKey === undefined) break;
-			this.lanes.delete(lruKey);
+			this.forget(lruKey);
 		}
 	}
 
@@ -472,12 +523,12 @@ export class AcpLaneRegistry {
 	/** Lifecycle cleanup: drop records that cannot belong to the active parent. */
 	clearExceptParent(parentSessionId: string): void {
 		for (const [key, record] of this.lanes) {
-			if (record.parentSessionId !== parentSessionId) this.lanes.delete(key);
+			if (record.parentSessionId !== parentSessionId) this.forget(key);
 		}
 	}
 
 	clear(): void {
-		this.lanes.clear();
+		for (const key of [...this.lanes.keys()]) this.forget(key);
 		this.leases.clear();
 	}
 
@@ -673,11 +724,59 @@ export function shouldInvalidateLane(error: unknown): boolean {
 export class AcpStaleGenerationError extends Error {}
 
 /**
+ * session/set_config_option rejected a declared model override. The ACP
+ * session may already exist, but the requested model was not applied, so the
+ * caller must not treat the turn as a success on the default model.
+ */
+export class AcpModelOverrideError extends Error {}
+
+/**
  * The turn failed at an uncertain point after session establishment (e.g. the
  * adapter connection died mid-prompt). The session may have partially mutated;
  * treating it as resumable would be a guess, so the lane is invalidated.
  */
 export class AcpTurnUncertainError extends Error {}
+
+/**
+ * Collect selectable values for one session config option from an ACP
+ * `configOptions` array (session/new, session/load, or set_config_option).
+ */
+export function advertisedSessionConfigValues(configOptions: unknown, configId: string): string[] | undefined {
+	if (!Array.isArray(configOptions)) return undefined;
+	const option = configOptions.find((entry) => isRecord(entry) && entry.id === configId);
+	if (!isRecord(option) || !Array.isArray(option.options)) return undefined;
+	const values: string[] = [];
+	for (const item of option.options) {
+		if (!isRecord(item)) continue;
+		if (typeof item.value === "string") values.push(item.value);
+		if (Array.isArray(item.options)) {
+			for (const nested of item.options) {
+				if (isRecord(nested) && typeof nested.value === "string") values.push(nested.value);
+			}
+		}
+	}
+	return values;
+}
+
+/**
+ * Resolve a requested model to one advertised value. Exact `provider/id` wins;
+ * a bare id wins only when it matches exactly one advertised id. Returns
+ * undefined instead of fuzzy-matching a cousin (pi-acp's resolver will).
+ */
+export function resolveExactSessionConfigValue(requested: string, advertised: readonly string[]): string | undefined {
+	const trimmed = requested.trim();
+	if (!trimmed) return undefined;
+	const lower = trimmed.toLowerCase();
+	const exact = advertised.find((value) => value.toLowerCase() === lower);
+	if (exact !== undefined) return exact;
+	if (trimmed.includes("/")) return undefined;
+	const byId = advertised.filter((value) => {
+		const slash = value.lastIndexOf("/");
+		const id = slash === -1 ? value : value.slice(slash + 1);
+		return id.toLowerCase() === lower;
+	});
+	return byId.length === 1 ? byId[0] : undefined;
+}
 
 export function applyModelOverride(definition: AgentDef, model: string | undefined): AgentDef {
 	if (!model) return definition;
@@ -699,5 +798,14 @@ export function applyModelOverride(definition: AgentDef, model: string | undefin
 		...definition,
 		args: args.length > 0 ? args : undefined,
 		env: Object.keys(env).length > 0 ? env : undefined,
+		modelOverride: {
+			...override,
+			sessionConfig: override.sessionConfig
+				? {
+						configId: override.sessionConfig.configId,
+						value: substituteModel(override.sessionConfig.value, model),
+					}
+				: override.sessionConfig,
+		},
 	};
 }

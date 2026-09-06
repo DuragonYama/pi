@@ -8,8 +8,8 @@
  *      getAgentDir() does (PI_CODING_AGENT_DIR override, else ~/.pi/agent).
  *      Modules that are deliberately runtime-package-free (runner.ts, bg.ts,
  *      importable from plain-node tests) can't call the package's getAgentDir,
- *      so they resolve paths through this instead. Mirrors the inlined resolver
- *      already used in persistent-agents.ts.
+ *      so they resolve paths through this instead. persistent-agents.ts uses
+ *      the same helper.
  *
  *   2. `envInt()` — read a bounded operational limit from the environment,
  *      defaulting to the current baked-in value. This is what lets one profile
@@ -24,14 +24,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 /**
- * The active pi profile directory: `PI_CODING_AGENT_DIR` if set (a leading `~`
- * is expanded to the home dir), else `~/.pi/agent`. Same contract as pi's
- * getAgentDir() and persistent-agents.ts's inlined copy.
+ * The active pi profile directory: `PI_CODING_AGENT_DIR` if set (`~` and `~/`
+ * expand to the home dir; `~user/…` is left literal, matching pi's
+ * getAgentDir()), else `~/.pi/agent`.
  */
 export function agentDir(): string {
 	const env = process.env.PI_CODING_AGENT_DIR;
 	if (!env) return join(homedir(), ".pi", "agent");
-	return env.startsWith("~") ? join(homedir(), env.slice(1)) : env;
+	if (env === "~" || env.startsWith("~/")) return join(homedir(), env.slice(1));
+	return env;
 }
 
 /**

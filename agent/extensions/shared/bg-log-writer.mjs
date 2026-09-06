@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { closeSync, fstatSync, ftruncateSync, readSync, writeSync } from "node:fs";
+import { closeSync, fstatSync, ftruncateSync, readSync } from "node:fs";
+import { writeAll } from "./write-all.mjs";
 
 const LOG_FD = 3;
 const command = process.argv[2];
@@ -14,11 +15,8 @@ if (!command || !Number.isSafeInteger(activeMax) || activeMax < 1 || !Number.isS
 let size = fstatSync(LOG_FD).size;
 let closed = false;
 
-function writeAll(buffer, position) {
-	let offset = 0;
-	while (offset < buffer.length) {
-		offset += writeSync(LOG_FD, buffer, offset, buffer.length - offset, position + offset);
-	}
+function writeAt(buffer, position) {
+	writeAll(LOG_FD, buffer, position);
 }
 
 function retainTail(maxBytes) {
@@ -31,7 +29,7 @@ function retainTail(maxBytes) {
 		read += count;
 	}
 	ftruncateSync(LOG_FD, 0);
-	if (read > 0) writeAll(tail.subarray(0, read), 0);
+	if (read > 0) writeAt(tail.subarray(0, read), 0);
 	size = read;
 }
 
@@ -40,12 +38,12 @@ function append(chunk) {
 	if (buffer.length >= activeMax) {
 		ftruncateSync(LOG_FD, 0);
 		const tail = buffer.subarray(buffer.length - activeMax);
-		writeAll(tail, 0);
+		writeAt(tail, 0);
 		size = tail.length;
 		return;
 	}
 	if (size + buffer.length > activeMax) retainTail(Math.min(finalMax, activeMax - buffer.length));
-	writeAll(buffer, size);
+	writeAt(buffer, size);
 	size += buffer.length;
 }
 

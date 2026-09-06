@@ -8,9 +8,11 @@
  *   - whether a follow-up prompt proves retained semantic context
  *   - leftover adapter processes after the runs (cleanup check)
  *
- * It exercises the exact production path (`runDelegation`, minimal child env,
+ * It exercises the production spawn path (`runDelegation`, minimal child env,
  * capability gating, per-call process-group kill) rather than a parallel
- * reimplementation, so results reflect what the `subagent` tool would do.
+ * reimplementation. PolicyClient is constructed with the default trust
+ * level — not the production `trust:"full"` used for the claude and cursor
+ * adapters — so permission decisions here are the default-fleet policy.
  *
  * Non-secret-bearing by design: output contains statuses only — never session
  * IDs, credentials, or inherited environment values. An adapter that fails

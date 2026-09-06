@@ -5,11 +5,11 @@
  * *client* (orchestrator) and spawns external agents (Claude Code, Codex,
  * Cursor, Hermes, pi, …) over stdio, collecting their streamed output.
  *
- * Safety model: every permission request the subagent makes is routed through
- * the policy here. Read-only operations are auto-approved; anything else is
- * confirmed with the user (or rejected when no UI is available), and
- * destructive-command patterns are always flagged. Session-scoped approvals
- * last for the duration of one delegation.
+ * Safety model: every permission request is routed through PolicyClient.
+ * Non-dangerous write/edit/execute auto-allow (grant 2026-08-13). Danger-
+ * scanned ops prompt when a UI is present and fail closed with no UI.
+ * trust:"full" (claude, cursor) bypasses the danger floor. Allow-always is
+ * never selected; session-scoped approvals last one delegation.
  */
 
 import { spawn } from "node:child_process";
@@ -19,11 +19,12 @@ import {
 	chmodSync,
 	existsSync,
 	readFileSync,
+	realpathSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { types as utilTypes } from "node:util";
 // Type-only: erased at runtime, so the SDK still loads lazily in runDelegation.
@@ -32,6 +33,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { findDangerous, findSsrf, type Pattern } from "../shared/danger.ts";
 import { agentDir } from "../shared/env-config.ts";
 import {
+	AcpModelOverrideError,
 	AcpResumeUnsupportedError,
 	AcpSessionUnusableError,
 	AcpStaleGenerationError,
@@ -41,12 +43,21 @@ import {
 	parseAgentConfig,
 	planRunnerContinuity,
 	redactSecrets,
+	advertisedSessionConfigValues,
+	resolveExactSessionConfigValue,
 	type AgentConfig,
 	type AgentDef,
 	type AgentTrust,
 	type ContinuityMode,
 	type RunnerContinuity,
 } from "./core.ts";
+import { utf8HeadWithin, utf8TailWithin } from "../shared/utf8.ts";
+import {
+	formatAdapterLabel,
+	getLanePeekStore,
+	type AdapterPackageInfo,
+	type PeekUsage,
+} from "./lane-peek.ts";
 
 export type { AgentConfig, AgentDef, AgentTrust } from "./core.ts";
 export { AcpStaleGenerationError } from "./core.ts";
@@ -62,6 +73,11 @@ const CONFIG_PATH = join(agentDir(), "acp-subagents.json");
 
 // There is deliberately no built-in default config: a missing file must never
 // activate stale or PATH-dependent adapter commands.
+function warnModelOverrideShape(message: string): void {
+	process.stderr.write(`[acp-subagents] ${message}\n`);
+	logPolicy(`model-override-unavailable ${message}`);
+}
+
 export function loadConfigFromPath(configPath: string): AgentConfig {
 	if (!existsSync(configPath)) {
 		throw new Error(
@@ -69,8 +85,19 @@ export function loadConfigFromPath(configPath: string): AgentConfig {
 				"Native subagents remain available; configure ACP agents in that file before requesting one.",
 		);
 	}
+	let parsed: unknown;
 	try {
-		return parseAgentConfig(JSON.parse(readFileSync(configPath, "utf-8")));
+		parsed = JSON.parse(readFileSync(configPath, "utf-8"));
+	} catch (error) {
+		throw new Error(
+			`Could not load ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	try {
+		// modelOverride shape problems warn and drop that adapter's override; they
+		// must not reject the file (an older in-memory runner + a newer pi
+		// sessionConfig field previously killed every ACP spawn).
+		return parseAgentConfig(parsed, warnModelOverrideShape);
 	} catch (error) {
 		throw new Error(
 			`Could not load ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
@@ -102,9 +129,25 @@ const MAX_PERMISSION_RAW_BYTES = 64 * 1024;
 const MAX_PERMISSION_RAW_NODES = 4096;
 const MAX_PERMISSION_RAW_DEPTH = 32;
 const MAX_ACP_PROTOCOL_LINE_BYTES = 1024 * 1024;
+const MAX_FAILURE_MESSAGE_BYTES = 4096;
+const FULL_TRUST_NOTICE_MAX = 256;
+const fullTrustNoticed = new Set<string>();
+let fullTrustNoticeSeq = 0;
+
+/** True on the first notice for `key`; bounds the set so it cannot grow without limit. */
+function firstFullTrustNotice(key: string): boolean {
+	if (fullTrustNoticed.has(key)) return false;
+	if (fullTrustNoticed.size >= FULL_TRUST_NOTICE_MAX) {
+		const oldest = fullTrustNoticed.values().next().value;
+		if (oldest !== undefined) fullTrustNoticed.delete(oldest);
+	}
+	fullTrustNoticed.add(key);
+	return true;
+}
+
 const DEFAULT_INHERITED_ENV = [
 	"HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
-	"SHELL", "USER", "LOGNAME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "SSH_AUTH_SOCK",
+	"SHELL", "USER", "LOGNAME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
 ];
 const TRUSTED_COMMAND_PATHS = [
 	join(homedir(), ".local", "bin"),
@@ -136,12 +179,151 @@ export function buildChildEnv(def: AgentDef): NodeJS.ProcessEnv {
  * stderr, generic errors, adapter text, policy-log lines, final output. Exact
  * match only — a session ID is an opaque token, never a pattern.
  */
+const SDK_DEP_KEYS = ["claude-agent-sdk", "@anthropic-ai/claude-agent-sdk", "@agentclientprotocol/sdk"];
+
+/**
+ * Best-effort adapter identity: walk from `command` (after realpath) to the
+ * nearest package.json and read name/version plus a pinned SDK dep.
+ * No network, no CLI comparison — just what the binary actually ships.
+ */
+export function resolveAdapterPackageInfo(command: string): AdapterPackageInfo {
+	let dir: string;
+	try {
+		dir = dirname(realpathSync(command));
+	} catch {
+		dir = dirname(command);
+	}
+	for (let i = 0; i < 8; i++) {
+		const pkgPath = join(dir, "package.json");
+		if (existsSync(pkgPath)) {
+			try {
+				const pkg = JSON.parse(readFileSync(pkgPath, "utf-8")) as {
+					name?: unknown;
+					version?: unknown;
+					dependencies?: Record<string, string>;
+					optionalDependencies?: Record<string, string>;
+				};
+				const deps = { ...pkg.dependencies, ...pkg.optionalDependencies };
+				let sdk: string | undefined;
+				for (const key of SDK_DEP_KEYS) {
+					if (typeof deps[key] === "string") {
+						sdk = `${key}@${deps[key]}`;
+						break;
+					}
+				}
+				return {
+					name: typeof pkg.name === "string" ? pkg.name : undefined,
+					version: typeof pkg.version === "string" ? pkg.version : undefined,
+					sdk,
+				};
+			} catch {
+				/* unreadable package.json — keep walking */
+			}
+		}
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return {};
+}
+
+function caughtErrorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Compose the model-visible ACP failure line. Adapter error + stderr tail
+ * attach on both pre- and post-establish paths, always through `safeText`
+ * (session-id scrubber). Versions always attach when known.
+ */
+export function formatAcpFailure(args: {
+	established: boolean;
+	error?: unknown;
+	stderr?: string;
+	adapter?: AdapterPackageInfo;
+	safeText: (text: string) => string;
+}): string {
+	const header = args.established
+		? "ACP turn failed after session establishment"
+		: "ACP delegation failed before a session was established";
+	const errorText = args.error !== undefined ? caughtErrorText(args.error) : "";
+	const stderrText = args.stderr ? utf8TailWithin(args.stderr, 2000) : "";
+	const harvested = harvestOpaqueIds(errorText, stderrText);
+	const parts = [header];
+	if (args.error !== undefined) {
+		const detail = args.safeText(applyOpaqueScrub(errorText, harvested)).replace(/\s+/g, " ").trim();
+		if (detail) parts.push(detail);
+	}
+	const versions = formatAdapterLabel(args.adapter);
+	if (versions) parts.push(versions);
+	if (args.stderr) {
+		const tail = args.safeText(applyOpaqueScrub(stderrText, harvested)).replace(/\s+/g, " ").trim();
+		if (tail) parts.push(`stderr: ${tail}`);
+	}
+	return utf8HeadWithin(parts.join(" — "), MAX_FAILURE_MESSAGE_BYTES);
+}
+
 export function redactExact(text: string, secrets: ReadonlySet<string>): string {
 	let out = text;
 	for (const secret of secrets) {
 		if (secret.length > 0 && out.includes(secret)) out = out.split(secret).join("REDACTED");
 	}
 	return out;
+}
+
+/**
+ * Conservative opaque-id scrub. Keyword (session / sessionId / id) may be
+ * separated from the token by JSON/config punctuation. A keyword-adjacent
+ * token is opaque iff it contains a digit, an uppercase letter, or a hyphen;
+ * pure lowercase snake_case (`resource_exhausted`) survives by shape.
+ * UUID / long-hex shapes are also scrubbed standalone.
+ */
+const OPAQUE_ID_KEYWORD =
+	/(?:session[_-]?id|sessionId|\bsession|\bid)[:"'\[\]\s=]*([A-Za-z0-9._+/-]+)/gi;
+
+function isOpaqueToken(token: string): boolean {
+	if (/^[a-z_]+$/.test(token)) return false;
+	return /[0-9A-Z-]/.test(token);
+}
+
+const BARE_ID_KEYWORD = /^(?:session(?:[_-]?id)?|id)$/i;
+
+export function harvestOpaqueIds(...texts: string[]): Set<string> {
+	const harvested = new Set<string>();
+	for (const text of texts) {
+		let pos = 0;
+		while (pos < text.length) {
+			OPAQUE_ID_KEYWORD.lastIndex = pos;
+			const match = OPAQUE_ID_KEYWORD.exec(text);
+			if (!match) break;
+			const token = match[1];
+			const start = match.index ?? 0;
+			if (token && BARE_ID_KEYWORD.test(token)) {
+				// `session id=secret`: first pass captures `id` as the token.
+				// Resume at that keyword so `id=secret` can harvest the real id.
+				pos = start + match[0].length - token.length;
+				if (pos <= start) pos = start + 1;
+				continue;
+			}
+			if (token && isOpaqueToken(token)) harvested.add(token);
+			pos = start + match[0].length;
+		}
+	}
+	return harvested;
+}
+
+export function applyOpaqueScrub(text: string, harvested: ReadonlySet<string>): string {
+	let out = text;
+	for (const token of harvested) {
+		if (token.length > 0) out = out.split(token).join("REDACTED");
+	}
+	out = out.replace(/\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g, "REDACTED");
+	out = out.replace(/\b[0-9a-fA-F]{20,}\b/g, "REDACTED");
+	return out;
+}
+
+export function scrubOpaqueIds(text: string): string {
+	return applyOpaqueScrub(text, harvestOpaqueIds(text));
 }
 
 function logPolicy(line: string): void {
@@ -322,6 +504,14 @@ export class PolicyClient {
 	private agentLabel: string;
 	/** Present only for the gated fleet runtime. */
 	declare private isStale: (() => boolean) | undefined;
+	/**
+	 * Stable identity for the first-notice toast: ACP lane key (preferred) or
+	 * a per-instance fallback. Session id from the request wins when present
+	 * so two PolicyClients on the same resumed conversation share one toast.
+	 */
+	private noticeKey: string;
+	/** Full-trust auto-allows this PolicyClient (log counter only). */
+	private fullTrustAllows = 0;
 
 	constructor(
 		ctx: ExtensionContext,
@@ -330,6 +520,7 @@ export class PolicyClient {
 		trust: AgentTrust = "default",
 		agentLabel = "",
 		isStale?: () => boolean,
+		noticeKey?: string,
 	) {
 		this.ctx = ctx;
 		this.sessionAllowed = sessionAllowed;
@@ -337,6 +528,7 @@ export class PolicyClient {
 		this.trust = trust;
 		this.agentLabel = agentLabel;
 		if (isStale) this.isStale = isStale;
+		this.noticeKey = noticeKey && noticeKey.length > 0 ? `lane:${noticeKey}` : `instance:${++fullTrustNoticeSeq}`;
 	}
 
 	/** Exact enum-kind matching only: never trust optionId/name substrings. */
@@ -385,7 +577,16 @@ export class PolicyClient {
 		// floor. Reached only by adapters explicitly marked trust:"full" in the ACP
 		// config; the default fleet still runs the full policy below.
 		if (this.trust === "full") {
-			log(`AUTO-ALLOW (full-trust): ${title}`);
+			this.fullTrustAllows++;
+			log(`AUTO-ALLOW (full-trust #${this.fullTrustAllows}): ${title}`);
+			const key =
+				params.sessionId && params.sessionId.length > 0 ? `session:${params.sessionId}` : this.noticeKey;
+			if (firstFullTrustNotice(key) && this.ctx.hasUI && typeof this.ctx.ui?.notify === "function") {
+				this.ctx.ui.notify(
+					`${this.agentLabel || "adapter"}: full-trust auto-allow (danger floor bypassed for this lane)`,
+					"warning",
+				);
+			}
 			return select(allowOnce);
 		}
 
@@ -625,6 +826,12 @@ export interface RunOptions {
 	/** Fires on each child reasoning (thought) chunk (drives the Loom's ∴ beads). */
 	onThought?: () => void;
 	/**
+	 * Lane identity for the peek ring buffer. When set, session/update
+	 * activity (tools, assistant tail, usage, last error) is retained
+	 * until the lane is evicted or the agent is killed.
+	 */
+	peekKey?: string;
+	/**
 	 * MCP servers to attach to the delegated session (passed on BOTH session/new
 	 * and session/load). Defaults to none. Transports: in-process HTTP, a stdio
 	 * shim, or (experimental, adapter-dependent) ACP. Threaded verbatim into the
@@ -694,6 +901,70 @@ interface PromptTurnSession {
 	nextUpdate(): Promise<ActiveSessionMessage>;
 }
 
+interface AcpSessionConfigClient {
+	request(method: string, params: { sessionId: string; configId: string; value: string }): Promise<unknown>;
+}
+
+/**
+ * Apply a declared `modelOverride.sessionConfig` via ACP
+ * `session/set_config_option` after the session exists and before the prompt.
+ * Spawn-time env/args cannot reach in-process adapters such as pi-acp (shared
+ * daemon; `createAgentSession` ignores argv). Combined env+sessionConfig is
+ * intentional: env (`PI_ACP_MODEL_OVERRIDE`) is a no-op compat key so older
+ * in-memory runners accept the file; this path still applies sessionConfig
+ * exactly once. Pi overrides only take effect in sessions started after this
+ * runner change — a live session must restart to pick up the new code.
+ */
+async function applySessionConfigOverride(
+	cx: AcpSessionConfigClient,
+	sessionId: string,
+	def: AgentDef,
+	setConfigOptionMethod: string,
+	advertisedValues?: readonly string[],
+): Promise<void> {
+	const sessionConfig = def.modelOverride?.sessionConfig;
+	if (!sessionConfig) return;
+	let value = sessionConfig.value;
+	if (advertisedValues && advertisedValues.length > 0) {
+		const resolved = resolveExactSessionConfigValue(value, advertisedValues);
+		if (!resolved) {
+			const lower = value.trim().toLowerCase();
+			const idHits = !value.includes("/")
+				? advertisedValues.filter((entry) => {
+						const slash = entry.lastIndexOf("/");
+						const id = slash === -1 ? entry : entry.slice(slash + 1);
+						return id.toLowerCase() === lower;
+					})
+				: [];
+			throw new AcpModelOverrideError(
+				idHits.length > 1
+					? `ACP adapter advertises ${idHits.length} models named "${value}"; pass a provider/id (${idHits.join(", ")})`
+					: `ACP adapter does not advertise model "${value}" for session/set_config_option (${sessionConfig.configId})`,
+			);
+		}
+		value = resolved;
+	}
+	try {
+		const response = (await cx.request(setConfigOptionMethod, {
+			sessionId,
+			configId: sessionConfig.configId,
+			value,
+		})) as { configOptions?: Array<{ id?: string; currentValue?: unknown }> };
+		const current = response.configOptions?.find((option) => option.id === sessionConfig.configId)?.currentValue;
+		if (typeof current === "string" && !resolveExactSessionConfigValue(sessionConfig.value, [current])) {
+			throw new AcpModelOverrideError(
+				`ACP adapter applied "${current}" instead of requested model "${sessionConfig.value}"`,
+			);
+		}
+	} catch (error) {
+		if (error instanceof AcpModelOverrideError) throw error;
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new AcpModelOverrideError(
+			`ACP adapter failed to apply model override via ${setConfigOptionMethod} (${sessionConfig.configId}=${value}): ${detail}`,
+		);
+	}
+}
+
 /**
  * The bounded prompt/update loop shared by fresh (`session/new`) and loaded
  * (`session/load`) sessions: identical text/tool-call caps either way.
@@ -707,6 +978,7 @@ async function collectPromptTurn(
 	onThought?: () => void,
 	isStale?: () => boolean,
 	kill?: () => void,
+	peekKey?: string,
 ) {
 	let text = "";
 	const toolCalls: string[] = [];
@@ -718,23 +990,37 @@ async function collectPromptTurn(
 
 	throwIfStale();
 	session.prompt(task);
+	if (peekKey) getLanePeekStore().beginTurn(peekKey);
 	onPromptSubmitted?.();
 
 	for (;;) {
 		const msg = await session.nextUpdate();
 		throwIfStale();
 		if (msg.kind === "stop") {
+			const usage = normalizeAcpUsage(msg.response.usage);
+			if (peekKey) {
+				const peekUsage: PeekUsage = {
+					inputTokens: usage.inputTokens,
+					outputTokens: usage.outputTokens,
+					cachedReadTokens: usage.cachedReadTokens,
+					cachedWriteTokens: usage.cachedWriteTokens,
+					thoughtTokens: usage.thoughtTokens,
+				};
+				if (usage.cost !== undefined) peekUsage.cost = usage.cost;
+				getLanePeekStore().noteUsage(peekKey, peekUsage);
+			}
 			return {
 				text,
 				toolCalls,
 				stopReason: msg.response.stopReason,
-				usage: normalizeAcpUsage(msg.response.usage),
+				usage,
 			};
 		}
 		const update = msg.update;
 		if (update?.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") {
 			text = appendBoundedUtf8(text, update.content.text, ACP_TEXT_TAIL_BYTES);
 			onText(text);
+			if (peekKey) getLanePeekStore().noteAssistant(peekKey, text);
 		} else if (update?.sessionUpdate === "agent_thought_chunk") {
 			// The child is reasoning — signal it so the Loom shows ∴ beads. We don't
 			// retain the thought text (it's the model's private chain-of-thought).
@@ -746,6 +1032,13 @@ async function collectPromptTurn(
 				kind: update.kind,
 				status: update.status,
 			});
+			if (peekKey) {
+				getLanePeekStore().noteTool(
+					peekKey,
+					typeof update.kind === "string" && update.kind ? update.kind : "tool",
+					typeof update.title === "string" ? update.title : String(update.toolCallId ?? ""),
+				);
+			}
 			const entry = appendBoundedUtf8(
 				"",
 				`${update.status ?? "?"}: ${update.title ?? update.toolCallId ?? "tool call"}`,
@@ -775,6 +1068,7 @@ export async function runDelegation({
 	onThought,
 	mcpServers = [],
 	onInitialized,
+	peekKey,
 }: RunOptions) {
 	// The SDK is only needed when an ACP delegation actually runs. Keeping it
 	// out of the extension startup path saves module parse/load work in sessions
@@ -806,6 +1100,11 @@ export async function runDelegation({
 		onSessionEstablished?.(info);
 	};
 	const safeText = (text: string) => redactExact(text, sensitiveIds);
+	const adapterInfo = resolveAdapterPackageInfo(def.command);
+	logPolicy(
+		`spawn ${basename(def.command)} ${formatAdapterLabel(adapterInfo) || "adapter=unknown"}`,
+	);
+	if (peekKey) getLanePeekStore().noteAdapter(peekKey, adapterInfo);
 
 	// Stderr is accumulated raw (byte-bounded) and scrubbed in one final pass
 	// at the return boundary: per-chunk scrubbing cannot catch a session ID
@@ -938,9 +1237,10 @@ export async function runDelegation({
 				}
 
 				let loadedSessionId: string | undefined;
+				let loadedConfigOptions: unknown;
 				if (plan.action === "load" && resumeSessionId !== undefined) {
 					try {
-						await cx.request(acp.methods.agent.session.load, {
+						const loadedResult = await cx.request(acp.methods.agent.session.load, {
 							sessionId: resumeSessionId,
 							cwd,
 							// `?? []` — a caller passing null (not undefined) would skip the
@@ -948,6 +1248,7 @@ export async function runDelegation({
 							mcpServers: (mcpServers ?? []) as never,
 						});
 						loadedSessionId = resumeSessionId;
+						loadedConfigOptions = (loadedResult as { configOptions?: unknown }).configOptions;
 					} catch {
 						if (continuityMode === "require") {
 							// Deliberately generic: adapter error text could echo the
@@ -965,6 +1266,14 @@ export async function runDelegation({
 
 				if (loadedSessionId !== undefined) {
 					const loaded = loadedSessionId;
+					const sessionConfigId = def.modelOverride?.sessionConfig?.configId;
+					await applySessionConfigOverride(
+						cx,
+						loaded,
+						def,
+						acp.methods.agent.session.setConfigOption,
+						sessionConfigId ? advertisedSessionConfigValues(loadedConfigOptions, sessionConfigId) : undefined,
+					);
 					sessionEstablished = true;
 					establish({ sessionId: loaded, continuity: "loaded" });
 					routeSessionId = loaded;
@@ -984,20 +1293,46 @@ export async function runDelegation({
 							nextUpdate: () => loadedUpdates.next(),
 						};
 					const safeOnText = (text: string) => onText(safeText(text));
-					const turn = isStale
-						? await collectPromptTurn(promptSession, task, safeOnText, onPromptSubmitted, onToolCall, onThought, isStale, kill)
-						: await collectPromptTurn(promptSession, task, safeOnText, onPromptSubmitted, onToolCall, onThought);
+					const turn = await collectPromptTurn(
+						promptSession,
+						task,
+						safeOnText,
+						onPromptSubmitted,
+						onToolCall,
+						onThought,
+						isStale,
+						kill,
+						peekKey,
+					);
 					return { ...turn, sessionId: loaded, continuity: "loaded" as RunnerContinuity };
 				}
 
 				const freshContinuity: RunnerContinuity = plan.action === "load" ? "rotated" : plan.continuity;
 				return cx.buildSession({ cwd, mcpServers: (mcpServers ?? []) as never }).withSession(async (session) => {
+					const sessionConfigId = def.modelOverride?.sessionConfig?.configId;
+					await applySessionConfigOverride(
+						cx,
+						session.sessionId,
+						def,
+						acp.methods.agent.session.setConfigOption,
+						sessionConfigId
+							? advertisedSessionConfigValues(session.newSessionResponse.configOptions, sessionConfigId)
+							: undefined,
+					);
 					sessionEstablished = true;
 					establish({ sessionId: session.sessionId, continuity: freshContinuity });
 					const safeOnText = (text: string) => onText(safeText(text));
-					const turn = isStale
-						? await collectPromptTurn(session, task, safeOnText, onPromptSubmitted, onToolCall, onThought, isStale, kill)
-						: await collectPromptTurn(session, task, safeOnText, onPromptSubmitted, onToolCall, onThought);
+					const turn = await collectPromptTurn(
+						session,
+						task,
+						safeOnText,
+						onPromptSubmitted,
+						onToolCall,
+						onThought,
+						isStale,
+						kill,
+						peekKey,
+					);
 					return { ...turn, sessionId: session.sessionId, continuity: freshContinuity };
 				});
 			});
@@ -1010,7 +1345,7 @@ export async function runDelegation({
 			turnResult = await client;
 		} catch (error) {
 			if (error instanceof AcpSessionUnusableError || error instanceof AcpResumeUnsupportedError) throw error;
-			if (error instanceof AcpStaleGenerationError) throw error;
+			if (error instanceof AcpStaleGenerationError || error instanceof AcpModelOverrideError) throw error;
 			// M1: a real load failure followed by a FAILED fresh creation leaves the
 			// old lane pointing at a dead session — invalidate it. A successful
 			// session/new (sessionEstablished) must not invalidate: timeout/abort
@@ -1028,10 +1363,20 @@ export async function runDelegation({
 			// M2: any other failure after a session was established (loaded or
 			// fresh) happened at an uncertain point mid-turn; the session may be
 			// partially mutated, so the lane is tainted rather than resumed.
-			if (sessionEstablished) throw new AcpTurnUncertainError("ACP turn failed after session establishment");
-			// Pre-establishment failure: the adapter's message may echo a session
-			// ID we never learned, so it is deliberately not surfaced.
-			throw new Error("ACP delegation failed before a session was established");
+			// Surface the adapter's verbatim error + pinned versions (Cyra's
+			// version-lag 400 was previously replaced with a generic string).
+			const failure = formatAcpFailure({
+				established: sessionEstablished,
+				error,
+				stderr,
+				adapter: adapterInfo,
+				safeText,
+			});
+			if (peekKey) getLanePeekStore().noteError(peekKey, failure);
+			if (sessionEstablished) throw new AcpTurnUncertainError(failure);
+			// Pre-establishment: same surfacing as post-establish (error + stderr
+			// + versions), always through safeText so an unread session id is scrubbed.
+			throw new Error(failure);
 		}
 		const { text, toolCalls, stopReason, sessionId, continuity, usage } = turnResult;
 

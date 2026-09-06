@@ -8,7 +8,7 @@ description: How to coordinate persistent multi-harness sub-agents in pi. Use wh
 You (pi) are the orchestrator of standing, `/dm`-able workers running in other
 harnesses (claude, cursor, codex, hermes, …). This skill is the how-to; the
 load-bearing routing rules already live in your always-on guidelines and in
-`AGENTS.md` ("You are the orchestrator"). Verified against **pi 0.84.2, 2026-08-18**.
+`AGENTS.md` ("You are the orchestrator"). Verified against **pi 0.85.0, 2026-09-06**.
 
 ## The one rule that matters most
 

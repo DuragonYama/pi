@@ -81,5 +81,5 @@ PASS  step 5: restart-boundary phase passed — exit=0
 
 ## Gates (after recording results)
 
-- `./scripts/verify-harness.sh`: exit 0 — ALL HARNESS CHECKS PASSED (all 9 stages)
+- `./scripts/verify-harness.sh`: exit 0 — ALL HARNESS CHECKS PASSED (9 stages at the time; the gate now has 20)
 - `git diff --check`: exit 0, clean

@@ -101,6 +101,27 @@ expectDangerous("dd of=/dev/sda if=/dev/zero", "dd writing to /dev");
 expectDangerous("shutdown -h now", "power state change");
 expectDangerous(":(){ :|:& };:", "fork bomb");
 
+// B2 additions: shred / truncate(sensitive) / launchctl / crontab / filter-branch / npm publish
+expectDangerous("shred -u secret.txt", "shred");
+expectDangerous("/usr/bin/shred -n 3 file", "shred");
+expectDangerous("truncate /dev/sda", "truncate of block device/sensitive path");
+expectDangerous("truncate -s 0 ~/.ssh/id_rsa", "truncate of block device/sensitive path");
+expectDangerous("truncate ~/.gnupg/trustdb.gpg", "truncate of block device/sensitive path");
+expectDangerous("truncate ~/.pi/auth.json", "truncate of block device/sensitive path");
+expectSafe("truncate -s 0 log.txt");
+expectDangerous("launchctl unload ~/Library/LaunchAgents/x.plist", "launchctl");
+expectDangerous("crontab -r", "crontab");
+expectDangerous("git filter-branch -- --all", "git filter-branch");
+expectDangerous("git -C /tmp filter-branch -- --all", "git filter-branch");
+expectDangerous("npm publish", "npm publish");
+expectDangerous("npm --workspace foo publish", "npm publish");
+expectDangerous("npm --prefix /tmp/pkg publish", "npm publish");
+expectDangerous("npm --registry=https://registry.npmjs.org publish", "npm publish");
+expectDangerous("env npm --workspace foo publish", "npm publish");
+expectSafe("npm install");
+expectSafe("echo 'shred'");
+expectSafe("echo truncate /dev/x");
+
 // Benign lookalikes
 expectSafe("echo 'rm -rf is dangerous, kids'");
 expectSafe("npm run rm-rf-joke");

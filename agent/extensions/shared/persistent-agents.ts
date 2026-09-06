@@ -26,8 +26,8 @@
 
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
-import { homedir } from "node:os";
 import * as path from "node:path";
+import { agentDir } from "./env-config.ts";
 
 export interface PersistentAgentMeta {
 	/** Stable link to the Loom AgentRecord. */
@@ -115,15 +115,12 @@ function projectScope(): string {
 
 /**
  * `<agent-dir>/fleet/roster-<projectScope>.json` — holds session ids, so 0600 in a
- * 0700 dir. Resolves the agent dir the same way pi's getAgentDir() does (env
- * override, else ~/.pi/agent), inlined so this module stays package-free and
- * unit-testable. The `<projectScope>` suffix isolates concurrent same-profile
+ * 0700 dir. Resolves the agent dir via `agentDir()` (same contract as pi's
+ * getAgentDir). The `<projectScope>` suffix isolates concurrent same-profile
  * processes on different projects (see projectScope above).
  */
 function rosterPath(): string {
-	const env = process.env.PI_CODING_AGENT_DIR;
-	const agentDir = env ? (env.startsWith("~") ? path.join(homedir(), env.slice(1)) : env) : path.join(homedir(), ".pi", "agent");
-	return path.join(agentDir, "fleet", `roster-${projectScope()}.json`);
+	return path.join(agentDir(), "fleet", `roster-${projectScope()}.json`);
 }
 
 /**

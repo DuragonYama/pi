@@ -57,6 +57,47 @@ const noUi = {
 	assert.equal(ungatedFetch.outcome.optionId, "allow-once", "un-gated full-trust fetch decisions must stay unchanged");
 }
 
+// First full-trust auto-allow for a lane/session notifies once across PolicyClient
+// instances (a persistent /dm turn constructs a new client each time).
+{
+	const notices: string[] = [];
+	const notifyCtx = {
+		hasUI: true,
+		ui: {
+			select: async () => {
+				throw new Error("UI select must not be called under full-trust");
+			},
+			notify: (msg: string) => {
+				notices.push(msg);
+			},
+		},
+	} as any;
+	const turn1 = new PolicyClient(notifyCtx, new Set(), false, "full", "claude", undefined, "lane-claude-default");
+	const turn2 = new PolicyClient(notifyCtx, new Set(), false, "full", "claude", undefined, "lane-claude-default");
+	const first = await turn1.requestPermission({
+		sessionId: "sess-shared",
+		toolCall: { kind: "execute", title: "rm -rf /", rawInput: { command: "rm -rf /" } },
+		options,
+	});
+	const second = await turn2.requestPermission({
+		sessionId: "sess-shared",
+		toolCall: { kind: "edit", title: "edit source", rawInput: { path: "src/app.ts" } },
+		options,
+	});
+	assert.equal(first.outcome.optionId, "allow-once");
+	assert.equal(second.outcome.optionId, "allow-once");
+	assert.equal(notices.length, 1, "same session/lane notifies once across PolicyClient instances");
+	assert.match(notices[0], /full-trust auto-allow/);
+	const otherLane = new PolicyClient(notifyCtx, new Set(), false, "full", "claude", undefined, "lane-other");
+	const third = await otherLane.requestPermission({
+		sessionId: "sess-other",
+		toolCall: { kind: "edit", title: "edit other", rawInput: { path: "src/b.ts" } },
+		options,
+	});
+	assert.equal(third.outcome.optionId, "allow-once");
+	assert.equal(notices.length, 2, "a different session/lane gets its own first-notice");
+}
+
 const policy = new PolicyClient(noUi, new Set());
 const safe = await policy.requestPermission({
 	toolCall: { kind: "read", title: "read file", rawInput: { path: "/tmp/file" } },
@@ -339,6 +380,7 @@ assert.equal(invalidPrompts, 0, "oversized/deep raw input must never reach the a
 const childEnv = buildChildEnv({ command: "bare-acp" });
 assert.ok(!childEnv.PATH?.split(":").includes("."), "bare commands must not prepend the delegated cwd to PATH");
 assert.ok(childEnv.PATH?.split(":").every((entry) => entry.startsWith("/")), "child PATH entries must be absolute");
+assert.equal(childEnv.SSH_AUTH_SOCK, undefined, "SSH_AUTH_SOCK must not be inherited by default");
 
 // B6: the approval dialog must show the actual (redacted, bounded) raw input —
 // the adapter title alone is not informed consent.

@@ -77,6 +77,8 @@ export interface CommsServer {
 	mcpServerFor(loomId: string): McpServerConfig;
 	/** Invalidate an agent's token (called on /kill) so it can never route again. */
 	revoke(loomId: string): void;
+	/** Drop every token whose loomId is not in `keep` (session_start clearExceptParent). */
+	revokeExcept(keep: Iterable<string>): void;
 	close(): Promise<void>;
 }
 
@@ -308,6 +310,16 @@ export async function startCommsServer(deps: CommsDeps): Promise<CommsServer> {
 			const token = loomToToken.get(loomId);
 			if (token) tokenToLoom.delete(token);
 			loomToToken.delete(loomId);
+		},
+		revokeExcept(keep: Iterable<string>) {
+			const keepSet = new Set(keep);
+			for (const loomId of [...loomToToken.keys()]) {
+				if (!keepSet.has(loomId)) {
+					const token = loomToToken.get(loomId);
+					if (token) tokenToLoom.delete(token);
+					loomToToken.delete(loomId);
+				}
+			}
 		},
 		close: () => new Promise<void>((resolve) => server.close(() => resolve())),
 	};

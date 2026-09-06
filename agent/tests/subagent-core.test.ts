@@ -410,6 +410,11 @@ assert.ok(
 		const paEnd = indexSource.indexOf('name: "subagent"', paIdx);
 		const paTool = indexSource.slice(paIdx, paEnd > paIdx ? paEnd : paIdx + 4000);
 		assert.ok(!paTool.includes("sessionId"), "persistent_agent list/history/message output must never include a session id");
+		assert.ok(paTool.includes('"peek"'), "persistent_agent must expose action peek");
+		assert.ok(paTool.includes("formatLanePeek"), "peek must render through formatLanePeek (no ad-hoc string concat)");
+		assert.ok(paTool.includes("background"), "persistent_agent message must accept an opt-in background flag");
+		assert.ok(paTool.includes("buildPersistentFollowUp"), "background message must use the shared follow-up helper");
+		assert.ok(paTool.includes('deliverAs: "followUp"'), "background persistent replies must arrive as followUp, not block the tool");
 	}
 }
 
@@ -555,6 +560,7 @@ for (const helperPath of [
 	assert.ok(!acpStepFn.includes("failedResumeNote"), "the note must not fire on the ordinary/first-spawn ACP path");
 	assert.ok(indexSource.includes("acpSessionCumulative"), "ACP usage must track last-seen cumulative per session id");
 	assert.ok(acpStepFn.includes("deltaAcpUsage"), "runAcpStep must map the per-turn delta, not the session lifetime total");
+	assert.ok(acpStepFn.includes("peekKey"), "runAcpStep must feed the ACP peek buffer with the lane key");
 	const commsReadyAt = acpStepFn.indexOf("await execution.commsReady");
 	const rosterStampAt = acpStepFn.indexOf("persistentAgents.register");
 	assert.ok(commsReadyAt >= 0 && rosterStampAt > commsReadyAt, "roster stamp must follow the commsReady wait");
