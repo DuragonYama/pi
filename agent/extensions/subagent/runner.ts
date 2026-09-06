@@ -13,6 +13,8 @@ import type { Message } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { codename, registry } from "../shared/agent-registry.ts";
 import { createFleetExitGate, registerFleetExecution } from "../shared/fleet-epoch.ts";
+import { envInt } from "../shared/env-config.ts";
+import { getLanePeekStore } from "../acp-subagents/lane-peek.ts";
 import * as persistentAgents from "../shared/persistent-agents.ts";
 import {
 	PolicyClient as AcpPolicyClient,
@@ -26,7 +28,9 @@ import {
 	AcpStaleGenerationError,
 	appendBoundedUtf8,
 	applyModelOverride as applyAcpModelOverride,
+	asResumeBloatError,
 	describeContinuity,
+	isResumeBloatError,
 	laneBusyError,
 	shouldInvalidateLane,
 	type RunnerContinuity,
@@ -69,6 +73,32 @@ export function setPromptQueueWrite(fn: QueueWrite): void {
 // last-seen CUMULATIVE ACP usage per session id, to derive per-turn deltas.
 // Grows over process lifetime (accepted leak; a future cleanup can drop on agent kill).
 export const acpSessionCumulative = new Map<string, AcpTurnUsage>();
+
+// Sessions already warned about resume bloat (one warning each; bounded FIFO).
+const resumeBloatWarned = new Set<string>();
+// Cumulative-token threshold for the advisory rotation warning. Evidence: ACP
+// adapters fail resumption opaquely once serialized history passes ~1MB.
+// Proxy = input + output + cacheWrite (lifetime cacheRead re-counts cached
+// input every turn and would trip the threshold early).
+const RESUME_BLOAT_WARN_TOKENS = envInt("PI_ACP_RESUME_BLOAT_WARN_TOKENS", 2_000_000, 100_000, 1_000_000_000);
+
+/** One advisory rotation warning per session, surfaced via the lane-peek store's lastError slot. */
+function warnResumeBloatOnce(laneKey: string, sessionId: string, cumulative: AcpTurnUsage): void {
+	if (!laneKey || resumeBloatWarned.has(sessionId)) return;
+	const processed =
+		(cumulative.inputTokens || 0) +
+		(cumulative.outputTokens || 0) +
+		(cumulative.cachedWriteTokens || 0);
+	if (!(processed > RESUME_BLOAT_WARN_TOKENS)) return;
+	resumeBloatWarned.add(sessionId);
+	if (resumeBloatWarned.size > 256) resumeBloatWarned.delete(resumeBloatWarned.values().next().value as string);
+	getLanePeekStore().noteError(
+		laneKey,
+		`Resume-bloat warning (not yet fatal): session accumulated ~${processed.toLocaleString("en-US")} tokens. ` +
+			"ACP sessions past ~1MB of serialized transcript fail to resume. Rotate at the next turn boundary: " +
+			"persistent_agent kill + respawn with a file-based handoff.",
+	);
+}
 
 /**
  * Run an ACP (external harness) step, returning the same SingleResult shape as
@@ -344,7 +374,10 @@ export async function runAcpStep(
 		const cumulative = result.usage;
 		const prev = result.sessionId ? acpSessionCumulative.get(result.sessionId) : undefined;
 		const delta = deltaAcpUsage(cumulative, prev);
-		if (result.sessionId) acpSessionCumulative.set(result.sessionId, cumulative);
+		if (result.sessionId) {
+			acpSessionCumulative.set(result.sessionId, cumulative);
+			warnResumeBloatOnce(execution.laneKey, result.sessionId, cumulative);
+		}
 		current.usage = acpUsageToStats(delta);
 		current.messages = [syntheticMessage(result.text, delta)];
 		current.stderr = result.stderr;
@@ -360,6 +393,7 @@ export async function runAcpStep(
 	} catch (error) {
 		// Drop the lane only when the error proves the stored session is
 		// unusable; a parent cancel or timeout leaves a healthy lane resumable.
+		if (isResumeBloatError(error)) error = asResumeBloatError(error);
 		if (execution.laneKey && !(error instanceof AcpStaleGenerationError) && shouldInvalidateLane(error)) {
 			execution.registry.invalidate(execution.laneKey);
 			// A persistent agent force-resumes its stored id, which would otherwise

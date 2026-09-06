@@ -6,6 +6,7 @@ import { Readable } from "node:stream";
 import {
 	AcpLaneRegistry,
 	AcpResumeUnsupportedError,
+	AcpResumeBloatError,
 	AcpSessionUnusableError,
 	AcpModelOverrideError,
 	AcpStaleGenerationError,
@@ -13,6 +14,8 @@ import {
 	appendBoundedUtf8,
 	advertisedSessionConfigValues,
 	applyModelOverride,
+	asResumeBloatError,
+	isResumeBloatError,
 	resolveExactSessionConfigValue,
 	createBoundedLineTransform,
 	DEFAULT_LANE_LABEL,
@@ -707,6 +710,25 @@ assert.deepEqual(planRunnerContinuity(false, false, "require"), { action: "fail"
 // --- Lane invalidation: only errors that prove the stored session unusable ---
 
 assert.equal(shouldInvalidateLane(new AcpSessionUnusableError("stored conversation not resumable")), true);
+assert.equal(
+	shouldInvalidateLane(new AcpResumeBloatError("ACP resume-bloat: protocol line exceeded. Rotate the worker.")),
+	true,
+	"a resume-bloated session is unusable: the lane must be invalidated",
+);
+assert.equal(
+	shouldInvalidateLane(new Error("ACP turn failed: ACP protocol line exceeded 1048576 bytes")),
+	true,
+	"the raw adapter bloat signature must invalidate the lane even before translation",
+);
+assert.equal(
+	shouldInvalidateLane(new Error("some other protocol line glitch")),
+	false,
+	"unrelated protocol errors must keep the lane resumable",
+);
+const bloatError = asResumeBloatError(new Error("opaque adapter failure"));
+assert.ok(bloatError instanceof AcpResumeBloatError, "translation produces the typed bloat error");
+assert.ok(/Rotate: dismiss the worker/.test(bloatError.message), "guidance names the rotation action");
+assert.ok(/opaque adapter failure/.test(bloatError.message), "guidance preserves the original cause");
 assert.equal(
 	shouldInvalidateLane(new AcpResumeUnsupportedError("adapter lacks loadSession")),
 	false,
