@@ -25,6 +25,46 @@ export function registerPersistentAgentTool(
 		details: null,
 	});
 
+	const shortId = (id: string): string => (id.length > 10 ? `${id.slice(0, 10)}…` : id);
+
+	function fmtAge(ms: number): string {
+		if (!Number.isFinite(ms) || ms < 0) return "now";
+		if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+		if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+		if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+		return `${Math.round(ms / 86_400_000)}d`;
+	}
+
+	function receiptAge(receipt: { queuedAt: number; deliveredAt?: number; droppedAt?: number; failedAt?: number }): string {
+		const at = receipt.deliveredAt ?? receipt.droppedAt ?? receipt.failedAt ?? receipt.queuedAt;
+		return fmtAge(Date.now() - at);
+	}
+
+	/** Compact per-agent queue/receipt summary for `list`; empty string when nothing to report. */
+	function queueSummary(loomId: string): string {
+		const depth = persist.queueDepth(loomId);
+		const receipts = persist.receiptsForRecipient(loomId);
+		if (!depth && !receipts.length) return "";
+		const parts: string[] = [`queue ${depth}`];
+		const last = receipts[receipts.length - 1];
+		if (last) {
+			parts.push(`last receipt ${shortId(last.id)} ${last.state} (${receiptAge(last)})${last.reason ? ` — ${last.reason.slice(0, 80)}` : ""}`);
+		}
+		return ` · ${parts.join(" · ")}`;
+	}
+
+	/** Bounded recent-receipts block for `peek` (no session ids; previews byte-truncated). */
+	function receiptBlock(loomId: string): string {
+		const depth = persist.queueDepth(loomId);
+		const receipts = persist.receiptsForRecipient(loomId).slice(-3);
+		if (!depth && !receipts.length) return "";
+		const lines = receipts.map((r) => {
+			const preview = r.preview ? ` — ${r.preview.length > 120 ? `${r.preview.slice(0, 120)}…` : r.preview}` : "";
+			return `  ${shortId(r.id)} ${r.state} (${receiptAge(r)})${r.reason ? ` — ${r.reason.slice(0, 80)}` : ""}${preview}`;
+		});
+		return `\nPeer queue: ${depth} queued · ${receipts.length} recent receipts:\n${lines.join("\n")}`;
+	}
+
 	// The orchestrator's interface to its persistent, /dm-able agents. Without
 	// this the model can only SPAWN (via subagent) and has no verb to see, reach,
 	// or dismiss a standing agent — so it re-spawns instead of resuming and can't
@@ -62,7 +102,7 @@ export function registerPersistentAgentTool(
 				const lines = list.map((m) => {
 					const r = registry.get(m.loomId);
 					const busy = r?.status === "running" || r?.status === "starting";
-					return `@${m.name} — ${m.harness} · ${busy ? "busy" : "idle"}${m.task ? ` · last: ${m.task.slice(0, 60)}` : ""}`;
+					return `@${m.name} — ${m.harness} · ${busy ? "busy" : "idle"}${m.task ? ` · last: ${m.task.slice(0, 60)}` : ""}${queueSummary(m.loomId)}`;
 				});
 				return asText(`Persistent agents (${list.length}):\n${lines.join("\n")}`);
 			}
@@ -87,10 +127,10 @@ export function registerPersistentAgentTool(
 				const meta = persistentAgents.byName(params.name);
 				if (!meta) return asText(`No persistent agent named "${params.name}".`);
 				const rec = peekStore.get(meta.laneKey);
-				if (!rec) return asText(`@${meta.name} has no captured ACP activity yet.`);
+				if (!rec) return asText(`@${meta.name} has no captured ACP activity yet.${receiptBlock(meta.loomId)}`);
 				const r = registry.get(meta.loomId);
 				const busy = r?.status === "running" || r?.status === "starting" || laneRegistry.isBusy(meta.laneKey);
-				return asText(formatLanePeek(rec, { name: meta.name, harness: meta.harness, busy }));
+				return asText(`${formatLanePeek(rec, { name: meta.name, harness: meta.harness, busy })}${receiptBlock(meta.loomId)}`);
 			}
 			// message — reject-if-busy so it never blocks the orchestrator's turn,
 			// tagged owner:"orchestrator" so a user /dm! won't abort π's own turn.
