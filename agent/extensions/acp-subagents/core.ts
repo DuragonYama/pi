@@ -717,8 +717,38 @@ export function planRunnerContinuity(
  */
 export function shouldInvalidateLane(error: unknown): boolean {
 	if (error instanceof AcpStaleGenerationError) return false;
+	if (error instanceof AcpResumeBloatError || isResumeBloatError(error)) return true;
 	return error instanceof AcpSessionUnusableError || error instanceof AcpTurnUncertainError;
 }
+
+/**
+ * Resume-bloat signature: adapters (claude-agent-acp, codex-acp observed
+ * 2026-09-06) fail session/load or mid-turn replay with an opaque oversized-
+ * transcript protocol error once a session's serialized history passes the
+ * adapter's internal limit (~1MB protocol line). The stored session is unusable
+ * for resume; the lane must be invalidated and the worker rotated.
+ */
+export function isResumeBloatError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	// Only signatures actually observed in the wild (claude-agent-acp + codex-acp,
+	// 2026-09-06). Broader clauses would invalidate healthy lanes on false matches.
+	return /protocol line exceeded|1048576/i.test(message);
+}
+
+/**
+ * Translate a resume-bloat failure into an error whose text tells the
+ * orchestrator exactly what to do, instead of an opaque protocol message.
+ */
+export function asResumeBloatError(error: unknown): AcpResumeBloatError {
+	const original = error instanceof Error ? error.message : String(error);
+	return new AcpResumeBloatError(
+		`ACP resume-bloat: ${original}. This session's transcript is past the adapter's resume limit; the lane was invalidated. ` +
+			`Rotate: dismiss the worker (persistent_agent kill) and respawn with a file-based handoff — reviews, specs, and commit hashes carry its durable state.`,
+	);
+}
+
+/** Resume-bloat error class: lane invalidating, rotation-directed. */
+export class AcpResumeBloatError extends Error {}
 
 /** A fleet barrier halted an older generation; its ACP lane stays resumable. */
 export class AcpStaleGenerationError extends Error {}
