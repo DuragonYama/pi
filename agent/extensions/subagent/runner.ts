@@ -31,7 +31,7 @@ import {
 	shouldInvalidateLane,
 	type RunnerContinuity,
 } from "../acp-subagents/core.ts";
-import { type AgentConfig } from "./agents.ts";
+import type { AgentConfig } from "./agents.ts";
 import {
 	buildNativeAgentArgs,
 	canonicalizeCwd,
@@ -493,6 +493,7 @@ export async function runSingleAgent(
 		clearLoomNoted(loomId);
 		throw err;
 	} finally {
+		if (persistent) execution.onPersistentTurnSettled?.(loomId);
 		unlinkIncomingAbort?.();
 		fleetExitGate?.seal();
 		resolveFleetDone?.();

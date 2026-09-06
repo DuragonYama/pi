@@ -37,6 +37,9 @@ import { loopGuard, startCommsServer, type CommsDeps } from "../extensions/subag
 		isLiveAgent: (loomId) => live.has(loomId),
 		async messageAgent(args) {
 			calls.push({ tool: "message_agent", args });
+			if (args.text === "queue me" || args.text === "queue retry") {
+				return { receipt: { id: "q_receipt_1", state: "queued", position: 2 } };
+			}
 			return { text: "reply-from-target" };
 		},
 		readHistory(args) {
@@ -87,6 +90,28 @@ import { loopGuard, startCommsServer, type CommsDeps } from "../extensions/subag
 		assert.equal(mc.args.callerName, "Caller", "caller name is resolved server-side");
 		assert.equal(mc.args.targetName, "Onyx", "leading @ is stripped from the target");
 		assert.equal(mc.args.text, "do the thing");
+		assert.equal(mc.args.requestId, 3, "the JSON-RPC id reaches routing for retry dedupe");
+
+		// Immediate response stays byte-for-byte compatible with the old path.
+		assert.equal(JSON.stringify(m.result), JSON.stringify({ content: [{ type: "text", text: "reply-from-target" }], isError: false }));
+
+		// A deferred delivery acknowledges immediately as ordinary non-error tool text.
+		const queuedStart = Date.now();
+		const q = await (await post(
+			{ jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "message_agent", arguments: { name: "Onyx", text: "queue me" } } },
+			token,
+		)).json() as any;
+		assert.ok(Date.now() - queuedStart < 1000, "queued acknowledgement must not wait for a target turn");
+		assert.equal(q.result.isError, false);
+		assert.equal(q.result.content[0].text, "Queued for @Onyx (receipt q_receipt_1; position 2). Delivery will occur when the worker becomes idle.");
+
+		// A transport retry carrying the same request id can return the same receipt.
+		const retry = await (await post(
+			{ jsonrpc: "2.0", id: 31, method: "tools/call", params: { name: "message_agent", arguments: { name: "Onyx", text: "queue retry" } } },
+			token,
+		)).json() as any;
+		assert.match(retry.result.content[0].text, /receipt q_receipt_1/);
+		assert.equal(calls.find((c) => c.tool === "message_agent" && c.args.text === "queue retry")!.args.requestId, 31);
 
 		// message_agent input validation: empty target / text is a tool error.
 		const bad = await (await post({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "message_agent", arguments: { name: "", text: "x" } } }, token)).json();

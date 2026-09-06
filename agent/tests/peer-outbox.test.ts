@@ -133,7 +133,7 @@ const input = (recipientLoomId: string, text: string, busy: boolean, requestKey?
 	};
 	const outbox = make(persistence);
 	const result = outbox.admit(input("A", "must not vanish", true));
-	assert.deepEqual(result, { kind: "persistence_failed", error: "disk full" });
+	assert.deepEqual(result, { kind: "persistence_failed", error: "peer outbox persistence failed: disk full" });
 	assert.equal(outbox.queueDepth(), 0);
 }
 

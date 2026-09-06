@@ -34,6 +34,8 @@ import type { McpServerConfig } from "../acp-subagents/runner.ts";
 export interface CommsToolResult {
 	text?: string;
 	error?: string;
+	/** Internal host receipt; the transport renders queued acknowledgements. */
+	receipt?: { id: string; state: "queued" | "delivered" | "dropped" | "failed"; position?: number };
 }
 
 /**
@@ -58,10 +60,11 @@ export interface CommsDeps {
 	isLiveAgent(loomId: string): boolean;
 	/**
 	 * Deliver `text` from the caller agent to the target agent BY NAME and return
-	 * its reply. MUST enforce loop-safety (self/depth/cycle) and reject-if-busy —
-	 * never queue from an MCP call. `callerLoomId` is the AUTHENTICATED sender.
+	 * its reply or an accepted-queue receipt. MUST enforce loop-safety
+	 * (self/depth/cycle), bounded admission, and authenticated attribution.
+	 * `callerLoomId` is the AUTHENTICATED sender; `requestId` supports retry dedupe.
 	 */
-	messageAgent(args: { callerLoomId: string; callerName: string; targetName: string; text: string }): Promise<CommsToolResult>;
+	messageAgent(args: { callerLoomId: string; callerName: string; targetName: string; text: string; requestId: unknown }): Promise<CommsToolResult>;
 	/** Read the recent exchange history of `targetName` (or the caller if omitted). */
 	readHistory(args: { callerLoomId: string; callerName: string; targetName?: string }): CommsToolResult;
 }
@@ -179,8 +182,13 @@ async function handleMcp(msg: any, caller: { loomId: string; name: string }, dep
 					const text = typeof args.text === "string" ? args.text.slice(0, MAX_TEXT_CHARS) : "";
 					if (!targetName) return { body: jsonRpcResult(id, toolText("message_agent requires a non-empty target agent name.", true)) };
 					if (!text) return { body: jsonRpcResult(id, toolText("message_agent requires non-empty text to send.", true)) };
-					const r = await deps.messageAgent({ callerLoomId: caller.loomId, callerName: caller.name, targetName, text });
-					return { body: jsonRpcResult(id, r.error ? toolText(r.error, true) : toolText(r.text ?? "(no reply)")) };
+					const r = await deps.messageAgent({ callerLoomId: caller.loomId, callerName: caller.name, targetName, text, requestId: id });
+					if (r.error) return { body: jsonRpcResult(id, toolText(r.error, true)) };
+					if (r.receipt?.state === "queued") {
+						const position = r.receipt.position === undefined ? "" : `; position ${r.receipt.position}`;
+						return { body: jsonRpcResult(id, toolText(`Queued for @${targetName} (receipt ${r.receipt.id}${position}). Delivery will occur when the worker becomes idle.`)) };
+					}
+					return { body: jsonRpcResult(id, toolText(r.text ?? "(no reply)")) };
 				}
 				if (toolName === TOOL_HISTORY) {
 					const targetName = typeof args.name === "string" && args.name.trim() ? args.name.replace(/^@/, "").trim() : undefined;

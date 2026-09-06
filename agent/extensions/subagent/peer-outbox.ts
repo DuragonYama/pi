@@ -72,6 +72,13 @@ export interface PeerOutboxOptions {
 	previewChars?: number;
 }
 
+export class PeerOutboxPersistenceError extends Error {
+	constructor(message: string, options?: { cause?: unknown }) {
+		super(`peer outbox persistence failed: ${message}`, options);
+		this.name = "PeerOutboxPersistenceError";
+	}
+}
+
 export interface PeerAdmission {
 	recipientLoomId: string;
 	recipientName: string;
@@ -379,6 +386,28 @@ export class PeerOutbox {
 		};
 	}
 
+	/** Force the current in-memory state through the synchronous persistence adapter. */
+	flush(): void {
+		this.save();
+	}
+
+	/**
+	 * Last-resort in-memory terminalization after a terminal receipt write failed.
+	 * Disk deliberately remains `delivering`, so restart recovery reports the
+	 * honest outcome-unknown state; memory advances so one bad write cannot strand
+	 * the recipient drain for the rest of this process.
+	 */
+	recoverTerminalInMemory(id: string, reason: string): PeerReceipt | undefined {
+		const receipt = this.receipts.get(id);
+		if (!receipt) return undefined;
+		const at = Math.max(this.now(), receipt.deliveryStartedAt ?? receipt.queuedAt);
+		receipt.state = "failed";
+		receipt.reason = this.preview(reason);
+		receipt.failedAt = at;
+		this.removeDelivery(id, receipt.recipientLoomId);
+		return cloneReceipt(receipt);
+	}
+
 	private newDelivery(input: PeerAdmission, now: number): PeerDelivery {
 		const id = this.id();
 		if (!nonEmpty(id) || this.receipts.has(id)) throw new Error("peer outbox id generator returned an empty or duplicate id");
@@ -528,7 +557,12 @@ export class PeerOutbox {
 	}
 
 	private save(): void {
-		this.persistence.save(JSON.stringify(this.snapshot(), null, 2) + "\n");
+		try {
+			this.persistence.save(JSON.stringify(this.snapshot(), null, 2) + "\n");
+		} catch (error) {
+			if (error instanceof PeerOutboxPersistenceError) throw error;
+			throw new PeerOutboxPersistenceError(this.errorText(error), { cause: error });
+		}
 	}
 
 	private validSnapshot(value: unknown): boolean {
