@@ -61,6 +61,13 @@ export interface PersistentAgentMeta {
 	 * the MCP `read_history` tool. Prompt/reply are byte-capped; NEVER a session id.
 	 */
 	exchanges?: Exchange[];
+	/**
+	 * The FIRST task the agent was spawned with — its role/protocol brief. Captured
+	 * once at registration and never overwritten by later per-turn tasks, so a
+	 * `rotate` (fresh session under the same identity) can re-seed the agent back
+	 * into role from disk-durable state. Byte-capped; NEVER a session id.
+	 */
+	standingBrief?: string;
 }
 
 export interface Exchange {
@@ -73,6 +80,7 @@ export interface Exchange {
 
 const MAX_EXCHANGES = 20;
 const MAX_EXCHANGE_CHARS = 2000;
+const MAX_STANDING_BRIEF_CHARS = 8000;
 
 const g = globalThis as unknown as { __piPersistentAgents?: Map<string, PersistentAgentMeta> };
 const store: Map<string, PersistentAgentMeta> = g.__piPersistentAgents ?? (g.__piPersistentAgents = new Map());
@@ -185,6 +193,12 @@ export function register(
 		...meta,
 		...(generation !== undefined ? { generation } : {}),
 	};
+	// Capture the first task as the durable standing brief (role/protocol): set once,
+	// never overwritten by later per-turn tasks, so `rotate` can re-seed a fresh
+	// session back into role. `...existing` above already carries a prior value.
+	if (!rec.standingBrief && typeof meta.task === "string" && meta.task.trim().length > 0) {
+		rec.standingBrief = meta.task.length > MAX_STANDING_BRIEF_CHARS ? `${meta.task.slice(0, MAX_STANDING_BRIEF_CHARS)}…` : meta.task;
+	}
 	store.set(rec.loomId, rec);
 	persist();
 	return rec;

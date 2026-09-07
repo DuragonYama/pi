@@ -28,6 +28,23 @@ whole point of agent-to-agent comms.
   `~/.pi/agent/.reviews/queue-design.md`). Worker replies are the strongest
   receipt; a queued acknowledgement is not. Added 2026-09-06 after two lost
   dispatches in one day.
+- **Orchestrator dispatch also queues now.** `persistent_agent message` with
+  `background:true` to a busy worker QUEUES behind its current work and delivers on
+  idle (reply as a follow-up) instead of returning "busy" and dropping — so a
+  background work order is never lost and must never be re-sent. A foreground
+  message still fast-fails on busy; re-send it with `background:true` to queue.
+- **Persistent vs ephemeral, and rotating.** Spawn `persistent:true` only for a
+  STANDING role (repeats under one protocol, addressed by name, owns a worktree);
+  one-shots (probe, triage, doc write, dogfood consumer) stay ephemeral — a
+  persistent one-off just bloats and dies. When a standing worker's session bloats
+  (or an ACP resume warning fires), `persistent_agent action:"rotate"` gives it a
+  FRESH session under the SAME @name/lane/worktree, re-seeded from the captured
+  standing brief. Pass `{task}` to change the role — or when the original spawn brief
+  fused role + a turn-1 task, since the captured brief then carries stale work (the
+  banner tells the worker not to redo committed work, but a clean role brief is
+  better). Prefer rotate over kill+respawn: peers keep their address, no re-briefing.
+  The identity is durable; the session is disposable. A busy worker refuses rotation —
+  rotate at an idle boundary, or `/kill` to force.
 - **/dm and `>>` chains, spawning, lanes, the Loom monitor**: not yet written as
   references. Probe the code (`extensions/subagent/`, `extensions/acp-subagents/`) or
   ask — and when a topic proves worth documenting, add a `references/<topic>.md` and a

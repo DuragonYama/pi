@@ -44,13 +44,18 @@ export function registerPersistentAgentTool(
 	function queueSummary(loomId: string): string {
 		const depth = persist.queueDepth(loomId);
 		const receipts = persist.receiptsForRecipient(loomId);
-		if (!depth && !receipts.length) return "";
-		const parts: string[] = [`queue ${depth}`];
+		const dispatches = persist.orchestratorPending(loomId);
+		if (!depth && !receipts.length && !dispatches) return "";
+		const parts: string[] = [];
+		// A busy worker with a dispatch in flight is LOADED, not stalled — the signal
+		// the merge-cycle cross-check needs (a queued dispatch is not silently lost).
+		if (dispatches) parts.push(`${dispatches} dispatch${dispatches === 1 ? "" : "es"} in flight`);
+		if (depth) parts.push(`peer queue ${depth}`);
 		const last = receipts[receipts.length - 1];
 		if (last) {
-			parts.push(`last receipt ${shortId(last.id)} ${last.state} (${receiptAge(last)})${last.reason ? ` — ${last.reason.slice(0, 80)}` : ""}`);
+			parts.push(`last peer receipt ${shortId(last.id)} ${last.state} (${receiptAge(last)})${last.reason ? ` — ${last.reason.slice(0, 80)}` : ""}`);
 		}
-		return ` · ${parts.join(" · ")}`;
+		return parts.length ? ` · ${parts.join(" · ")}` : "";
 	}
 
 	/** Bounded recent-receipts block for `peek` (no session ids; previews byte-truncated). */
@@ -77,20 +82,22 @@ export function registerPersistentAgentTool(
 			// Router-mode fix: state the worker-side capability as an invariant, then ban the relay.
 			"Persistent workers can message each other directly through their own message_agent tool. To make two standing workers converse, message ONE of them (persistent_agent action:\"message\") and tell IT to message_agent the other — never shuttle their replies back and forth yourself; hand-relaying worker-to-worker traffic is a bug, not a fallback.",
 			"To talk to a worker that already exists, always use persistent_agent (action:\"message\"), which resumes its session and keeps its context; never call subagent for it, which spawns a brand-new agent.",
+			"A busy worker no longer drops a background message: action:\"message\" with background:true QUEUES behind its current work and delivers when it frees (reply as a follow-up). Re-send ONLY if that follow-up reports it was NOT delivered (the rare 'did not free up in time'); a normal reply IS the receipt, so re-sending after a reply duplicates the order. A foreground message to a busy worker fast-fails — re-send it with background:true to queue instead of spinning.",
+			"When a worker's session is bloating (rotate-before-bloat, or an ACP resume warning), use action:\"rotate\" to give it a FRESH session under the SAME @name — cheaper and safer than kill+respawn, and peers keep addressing it. Pass a fresh brief in {task} only to change its role; omit it to reuse the captured standing brief.",
 		],
 		description: [
 			"See and control PERSISTENT sub-agents — the standing, directly-addressable workers created via subagent(persistent:true).",
-			"actions: 'list' (show every persistent agent with its @name, harness, and idle/busy status — call this to answer 'who do I have?' or before messaging one); 'message' (send {name, task} to an existing agent — this RESUMES its session and keeps its context, so ALWAYS use this to talk to a standing agent, never subagent, which would spawn a new one); 'history' (read {name}'s recent exchanges, including /dm messages the user sent it directly — use this to catch up on what an agent has been doing); 'peek' (live snapshot of what {name} is doing right now: recent tools, last assistant snippet, usage, last error — use this instead of scraping harness logs); 'kill' (dismiss {name}).",
+			"actions: 'list' (show every persistent agent with its @name, harness, and idle/busy status — call this to answer 'who do I have?' or before messaging one); 'message' (send {name, task} to an existing agent — this RESUMES its session and keeps its context, so ALWAYS use this to talk to a standing agent, never subagent, which would spawn a new one; background:true QUEUES when the worker is busy rather than dropping); 'history' (read {name}'s recent exchanges, including /dm messages the user sent it directly — use this to catch up on what an agent has been doing); 'peek' (live snapshot of what {name} is doing right now: recent tools, last assistant snippet, usage, last error — use this instead of scraping harness logs); 'rotate' (retire {name}'s bloated session and start a FRESH one under the same @name/lane/worktree — the cheap half of rotate-before-bloat; re-seeds from the captured standing brief, or {task} if you pass one); 'kill' (dismiss {name}).",
 			"Persistent agents are addressed by their assigned @name (e.g. Onyx, Cyra), NOT by their harness (claude/cursor). The user can also /dm them directly from the TUI.",
 		].join(" "),
 		parameters: Type.Object({
-			action: StringEnum(["list", "message", "history", "kill", "peek"] as const, { description: "list | message | history | kill | peek" }),
-			name: Type.Optional(Type.String({ description: "The persistent agent's @name (without the @). Required for message/history/kill/peek." })),
-			task: Type.Optional(Type.String({ description: "The message/task to send. Required for message." })),
+			action: StringEnum(["list", "message", "history", "kill", "peek", "rotate"] as const, { description: "list | message | history | kill | peek | rotate" }),
+			name: Type.Optional(Type.String({ description: "The persistent agent's @name (without the @). Required for message/history/kill/peek/rotate." })),
+			task: Type.Optional(Type.String({ description: "For message: the message/task to send (required). For rotate: an OPTIONAL fresh role brief to re-seed the new session — omit to reuse the agent's captured standing brief." })),
 			background: Type.Optional(
 				Type.Boolean({
 					description:
-						"message only. Default false (the tool waits for the worker's reply). When true, return immediately and deliver the reply later as a follow-up message.",
+						"message only. Default false (the tool waits for the worker's reply; fast-fails if the worker is busy). When true, return immediately and deliver the reply later as a follow-up — and if the worker is busy, the message is QUEUED behind its current work and delivered when it goes idle rather than dropped, so it is never lost and must not be re-sent.",
 				}),
 			),
 		}),
@@ -132,8 +139,25 @@ export function registerPersistentAgentTool(
 				const busy = r?.status === "running" || r?.status === "starting" || laneRegistry.isBusy(meta.laneKey);
 				return asText(`${formatLanePeek(rec, { name: meta.name, harness: meta.harness, busy })}${receiptBlock(meta.loomId)}`);
 			}
-			// message — reject-if-busy so it never blocks the orchestrator's turn,
-			// tagged owner:"orchestrator" so a user /dm! won't abort π's own turn.
+			if (params.action === "rotate") {
+				// Give a bloating standing worker a FRESH session under the same @name:
+				// reset (clearSession + lane invalidate), then dispatch the re-seed brief
+				// so the fresh turn mints the new session. Reuses the message follow-up path.
+				if (!params.name) return asText("rotate requires 'name'.");
+				const reset = persist.resetPersistentSession(params.name, params.task);
+				if ("error" in reset) return asText(reset.error);
+				void persist.messagePersistent(reset.name, reset.brief, ctx, { busyMode: "queue", owner: "orchestrator" })
+					.then((r) => {
+						pi.sendUserMessage(buildPersistentFollowUp(r.name ?? reset.name, r), { deliverAs: "followUp" });
+					})
+					.catch((error) => {
+						if (ctx.hasUI) ctx.ui.notify(`@${reset.name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+					});
+				return asText(`Rotated @${reset.name} onto a fresh session (same @name, lane, and worktree; prior session retired). Re-brief dispatched${params.task ? "" : " from its captured standing brief"}; its acknowledgement arrives as a follow-up.`);
+			}
+			// message — owner:"orchestrator" so a user /dm! won't abort π's own turn.
+			// background:true QUEUES behind a busy worker (never dropped, delivered on
+			// idle); foreground fast-fails on busy so it never blocks π's turn.
 			if (!params.name || !params.task) return asText("message requires both 'name' and 'task'.");
 			if (params.background) {
 				const meta = persistentAgents.byName(params.name);
@@ -141,11 +165,8 @@ export function registerPersistentAgentTool(
 					const roster = persistentAgents.all().map((m) => `@${m.name}`).join(", ") || "none";
 					return asText(`No persistent agent named "${params.name}". Current persistent agents: ${roster}.`);
 				}
-				const busy = persist.isMessageQueued(meta.loomId) || persist.isAgentBusy(meta.loomId, meta.laneKey);
-				if (busy) {
-					return asText(`Persistent agent @${meta.name} is busy right now. The user can /dm to queue behind it or /dm! to interrupt.`);
-				}
-				void persist.messagePersistent(params.name, params.task, ctx, { busyMode: "reject", owner: "orchestrator" })
+				const wasBusy = persist.isMessageQueued(meta.loomId) || persist.isAgentBusy(meta.loomId, meta.laneKey);
+				void persist.messagePersistent(params.name, params.task, ctx, { busyMode: "queue", owner: "orchestrator" })
 					.then((r) => {
 						pi.sendUserMessage(buildPersistentFollowUp(r.name ?? params.name!, r), { deliverAs: "followUp" });
 					})
@@ -154,10 +175,19 @@ export function registerPersistentAgentTool(
 							ctx.ui.notify(`@${params.name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
 						}
 					});
-				return asText(`Sent to @${params.name} in the background; the reply will arrive as a follow-up.`);
+				return asText(
+					wasBusy
+						? `@${meta.name} is busy — your message is QUEUED behind its current work and delivers when it frees; the reply arrives as a follow-up. Re-send ONLY if that follow-up says it was NOT delivered — a reply is the receipt.`
+						: `Sent to @${params.name} in the background; the reply will arrive as a follow-up.`,
+				);
 			}
 			const r = await persist.messagePersistent(params.name, params.task, ctx, { busyMode: "reject", owner: "orchestrator", onUpdate });
-			if (r.error) return asText(r.error);
+			if (r.error) {
+				if (r.busy) {
+					return asText(`@${params.name} is busy right now. Re-send with background:true to QUEUE it (delivered when the worker goes idle, reply as a follow-up) instead of waiting — do not spin.`);
+				}
+				return asText(r.error);
+			}
 			return asText(`@${r.name} replied:\n${r.text}`);
 		},
 	});

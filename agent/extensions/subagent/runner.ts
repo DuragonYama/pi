@@ -28,8 +28,10 @@ import {
 	AcpStaleGenerationError,
 	appendBoundedUtf8,
 	applyModelOverride as applyAcpModelOverride,
+	asQuotaError,
 	asResumeBloatError,
 	describeContinuity,
+	isQuotaError,
 	isResumeBloatError,
 	laneBusyError,
 	shouldInvalidateLane,
@@ -393,7 +395,11 @@ export async function runAcpStep(
 	} catch (error) {
 		// Drop the lane only when the error proves the stored session is
 		// unusable; a parent cancel or timeout leaves a healthy lane resumable.
+		// A provider-quota failure is rewritten to reroster-guidance but is NOT
+		// lane-invalidating (shouldInvalidateLane returns false), since the session
+		// resumes fine once the provider's window resets.
 		if (isResumeBloatError(error)) error = asResumeBloatError(error);
+		else if (isQuotaError(error)) error = asQuotaError(error, agentName);
 		if (execution.laneKey && !(error instanceof AcpStaleGenerationError) && shouldInvalidateLane(error)) {
 			execution.registry.invalidate(execution.laneKey);
 			// A persistent agent force-resumes its stored id, which would otherwise

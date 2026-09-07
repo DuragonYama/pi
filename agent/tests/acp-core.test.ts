@@ -727,7 +727,7 @@ assert.equal(
 );
 const bloatError = asResumeBloatError(new Error("opaque adapter failure"));
 assert.ok(bloatError instanceof AcpResumeBloatError, "translation produces the typed bloat error");
-assert.ok(/Rotate: dismiss the worker/.test(bloatError.message), "guidance names the rotation action");
+assert.ok(/persistent_agent action:"rotate"/.test(bloatError.message), "guidance names the rotation action");
 assert.ok(/opaque adapter failure/.test(bloatError.message), "guidance preserves the original cause");
 assert.equal(
 	shouldInvalidateLane(new AcpResumeUnsupportedError("adapter lacks loadSession")),

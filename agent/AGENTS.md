@@ -29,21 +29,31 @@ on demand — see the `pi-orchestration` skill.
 Lessons from the 2026-09-06 multi-worker build — encoded here because they failed in
 practice when they lived only in the orchestrator's head:
 
-1. **Verify dispatch receipt.** Receipts cover peer `message_agent` dispatches only —
-   `persistent_agent message` to a busy worker is still reject-if-busy (no queue, no
-   receipt): if it returns busy, retry on the worker's next idle or let the user queue
-   via /dm. For a peer dispatch: check `persistent_agent list`/`peek` for queue depth
-   and last receipt. A queued receipt means delivery is owned by the outbox — wait for
-   its `delivered`/`failed`/`dropped` terminal state; do NOT re-send (that duplicates).
-   Retry only when a dispatch produced NO receipt id at all. A worker reply is the
-   strongest receipt; a queued acknowledgement is not a delivery.
+1. **Dispatch does not silently drop; re-send only on a failure receipt.**
+   `persistent_agent message` with `background:true` to a busy worker QUEUES behind its
+   current work (including a multi-minute spawn turn) and delivers when it frees, with
+   the reply as a follow-up. Re-send ONLY when a follow-up says it was NOT delivered
+   (the rare "did not free up in time"); a normal reply IS the receipt, so re-sending
+   after a reply duplicates the order. A foreground message to a busy worker fast-fails
+   — re-send with `background:true` to queue. `list`/`peek` show `N dispatches in
+   flight` for a busy worker, so an idle worker with none is a real stall. Peer
+   `message_agent` dispatches carry durable receipts — a queued receipt means the outbox
+   owns delivery; wait for its `delivered`/`failed`/`dropped` terminal state, don't
+   re-send. A worker reply is the strongest receipt; a queued acknowledgement is not.
 2. **Merge-cycle cross-check.** At every merge/turn boundary, reconcile each worker's
    assigned work (and any dispatched-but-unacknowledged work orders) against its actual
    in-flight turns before assuming the pipeline is loaded. An idle worker with no
    assignment is a pipeline stall, not a rest.
 3. **Rotate before bloat.** Long-lived workers accumulate context and ACP sessions die
-   opaquely on resume past ~1MB. Rotate at a natural turn boundary (fresh worker +
-   file-based handoff: reviews/specs/commit hashes), don't wait for the death.
+   opaquely on resume past ~1MB. At a natural turn boundary — or on any resume/bloat
+   warning — use `persistent_agent action:"rotate"`: it retires the bloated session and
+   starts a FRESH, lean one under the SAME @name/lane/worktree (peers keep addressing
+   it), re-seeding from the captured standing brief. Prefer this over kill+respawn; it
+   costs one call and needs no re-briefing of peers. Don't wait for the death. If the
+   worker's original spawn brief bundled a turn-1 task (role + task fused), pass a clean
+   role brief in `{task}` on rotate so the fresh session isn't re-seeded with stale
+   work — the banner already tells it not to redo committed work, but a clean brief is
+   better. Then send the next concrete work order as a normal message.
 4. **Briefs state how to verify.** Every work order includes the exact rebuild/test
    commands for the artifacts under test ("rebuild exactly what you test" — a stale
    binary produces false FAILs and costs a verification round).
@@ -54,6 +64,28 @@ practice when they lived only in the orchestrator's head:
 6. **Reviews are files; reviews are not done by the orchestrator's memory.** The
    reviewer writes findings to `.reviews/<name>.md`; the orchestrator reads the file
    when the corresponding task's ping arrives, never as an interruption.
+7. **Persistent only for standing roles.** Spawn `persistent:true` only when the agent
+   is a STANDING role: it repeats across turns under one protocol (a reviewer, a dev
+   seat), peers address it by name, or it owns a worktree/branch. Everything else —
+   one-shot probes, a triage question, a doc write, an external-consumer dogfood — is
+   ephemeral (`persistent:false`, the default; the schema says the same). A persistent
+   agent you spawned for a one-off is a session that will bloat and die for no benefit
+   you cashed in; when in doubt, ephemeral + a file handoff. If the user asks for a
+   persistent agent where an ephemeral one clearly fits, say so before spawning — the
+   default is advisory, not a hard block.
+8. **Reproduce or delegate before you assert.** Before explaining a bug's mechanism to
+   the user, overruling a reviewer or a tester, or answering "is this a harness/app
+   bug" — either reproduce it yourself, or delegate the diagnosis (e.g. to the planner
+   model). State a mechanism as a hypothesis until it is verified. Asserting from an
+   artifact instead of running the thing is this seat's most common error; a wrong
+   confident claim costs more than the minute a probe takes.
+9. **A provider-quota failure means reroster, not respawn.** A worker that dies with a
+   quota/rate-limit error (surfaced as "ACP provider quota on <harness>: … resets
+   <time>") is not broken and its session is not lost — the provider is rate-limited
+   until the reset. Do NOT respawn or rotate it on the same harness; move that seat to
+   a DIFFERENT provider (grok/cursor, codex) now, assume sibling workers on the same
+   provider are dark too, and resume on the original after the reset. It is account-wide
+   across that provider's models (opus and fable fell together on 2026-09-06).
 
 ## Review workflow (always)
 

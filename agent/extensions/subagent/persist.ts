@@ -25,7 +25,7 @@ import {
 	type PeerDelivery,
 	type PeerReceipt,
 } from "./peer-outbox.ts";
-import { resolveStepTimeoutMs } from "./core.ts";
+import { MAX_STEP_TIMEOUT_SECONDS, resolveStepTimeoutMs } from "./core.ts";
 import { acpSessionCumulative, runAcpStep } from "./runner.ts";
 import { getResultOutput, isFailedResult, type OnUpdateCallback, type SingleResult, type StepExecution, type SubagentDetails } from "./types.ts";
 
@@ -128,6 +128,53 @@ export function createPersistentRuntime(deps: PersistDeps) {
 		}
 		return true;
 	};
+	// Settle-driven idle wait for QUEUED messages. A worker busy on a turn that is
+	// NOT tracked by agentGate — its initial spawn turn (spawned background:true), or
+	// a lane lease — has no promise to chain behind, so a queued dispatch would
+	// otherwise poll-and-cap and drop after the cap (spawn turns run minutes). Every
+	// persistent turn, spawn included, fires onPersistentTurnSettled (runner → the
+	// execution hook wired in dispatch.ts), so we wake exactly when the worker frees.
+	// The bound is only a stuck-agent safety (a live turn wakes us via the settle hook
+	// long before it, and a non-persistent lane holder relies on the coarse re-check
+	// timer), so it uses the MAX allowed step timeout rather than the default — a turn
+	// given a long timeoutSeconds must not be given up on early.
+	const idleWaiters = new Map<string, Set<() => void>>();
+	const signalIdle = (loomId: string): void => {
+		const set = idleWaiters.get(loomId);
+		if (!set) return;
+		idleWaiters.delete(loomId);
+		for (const wake of set) wake();
+	};
+	const waitForIdleViaSettle = async (loomId: string, laneKey: string, maxMs: number): Promise<boolean> => {
+		const deadline = Date.now() + maxMs;
+		while (isAgentBusy(loomId, laneKey)) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) return false;
+			await new Promise<void>((resolve) => {
+				let wake!: () => void;
+				const timer = setTimeout(() => {
+					const set = idleWaiters.get(loomId);
+					set?.delete(wake);
+					if (set && set.size === 0) idleWaiters.delete(loomId);
+					resolve();
+				}, Math.min(remaining, 2000));
+				wake = () => {
+					clearTimeout(timer);
+					resolve();
+				};
+				const set = idleWaiters.get(loomId) ?? new Set<() => void>();
+				set.add(wake);
+				idleWaiters.set(loomId, set);
+			});
+		}
+		return true;
+	};
+	// Orchestrator TOOL dispatches outstanding per agent (queued behind a busy turn OR
+	// running), so `persistent_agent list` can show that a busy worker already HAS a
+	// dispatch in flight — the observability half of the merge-cycle cross-check (a
+	// worker with a pending dispatch is loaded, not stalled). Peer relays are excluded
+	// (they carry a `from` and are counted by the peer outbox instead).
+	const orchestratorOutstanding = new Map<string, number>();
 
 	/**
 	 * One resume+prompt against a persistent agent's EXISTING Loom thread, forcing
@@ -156,10 +203,17 @@ export function createPersistentRuntime(deps: PersistDeps) {
 		if (isAgentBusy(meta.loomId, meta.laneKey)) {
 			// reject never blocks the caller's turn (e.g. an autonomous MCP message):
 			// a lane grabbed in the gap after the top-level check fails fast here
-			// instead of stalling up to 180s. queue/interrupt still wait it out.
+			// instead of stalling. queue waits on the settle signal (bounded only by the
+			// max allowed step timeout as a stuck-agent safety) so a dispatch queued
+			// behind a long spawn turn is delivered after it rather than dropped at a
+			// fixed cap; interrupt aborted our own turn, so the short poll suffices.
 			if (busyMode === "reject") return { busy: true, error: `@${meta.name} is busy right now; try again shortly.` };
-			if (!(await waitUntilIdle(meta.loomId, meta.laneKey, 180000))) {
-				return { busy: true, error: `@${meta.name} is still busy after waiting; try again.` };
+			const freed =
+				busyMode === "queue"
+					? await waitForIdleViaSettle(meta.loomId, meta.laneKey, MAX_STEP_TIMEOUT_SECONDS * 1000 + 30_000)
+					: await waitUntilIdle(meta.loomId, meta.laneKey, 180000);
+			if (!freed) {
+				return { busy: true, error: `@${meta.name} did not free up in time; the message was NOT delivered — re-send it.` };
 			}
 		}
 		const def = getAcpConfig().agents[meta.harness];
@@ -278,6 +332,10 @@ export function createPersistentRuntime(deps: PersistDeps) {
 			}
 			// queue (and interrupt-after-abort) fall through and chain.
 		}
+		// Count only orchestrator TOOL dispatches (message/rotate), not peer relays
+		// (which carry a `from`) — peer traffic is tracked by the outbox instead.
+		const isOrchestratorDispatch = owner === "orchestrator" && !opts?.from;
+		if (isOrchestratorDispatch) orchestratorOutstanding.set(meta.loomId, (orchestratorOutstanding.get(meta.loomId) ?? 0) + 1);
 		const prev = active ?? Promise.resolve();
 		let result: MsgResult;
 		const run = prev
@@ -299,6 +357,11 @@ export function createPersistentRuntime(deps: PersistDeps) {
 		try {
 			await run;
 		} finally {
+			if (isOrchestratorDispatch) {
+				const n = (orchestratorOutstanding.get(meta.loomId) ?? 1) - 1;
+				if (n <= 0) orchestratorOutstanding.delete(meta.loomId);
+				else orchestratorOutstanding.set(meta.loomId, n);
+			}
 			if (agentGate.get(meta.loomId) === run) agentGate.delete(meta.loomId);
 			// runPersistentOnce signals settlement before this gate-owning promise has
 			// unwound. Kick again after deleting the gate so a waiting peer cannot be
@@ -371,6 +434,7 @@ export function createPersistentRuntime(deps: PersistDeps) {
 	}
 
 	function onPersistentTurnSettled(loomId: string): void {
+		signalIdle(loomId); // wake any dispatch queued behind this worker's just-finished turn
 		kickPeerDrain(loomId);
 	}
 
@@ -550,6 +614,52 @@ export function createPersistentRuntime(deps: PersistDeps) {
 		return meta.name;
 	}
 
+	/**
+	 * Reset a persistent agent's SESSION while keeping its identity (name, lane,
+	 * worktree, model, history) — the cheap half of "rotate before bloat". Clears the
+	 * stored session id AND invalidates the lane record, so the NEXT message resolves
+	 * to a genuinely fresh, lean session (see runner resolve(): with no forced resume
+	 * id and no lane record, continuity "auto" yields action "fresh") and re-registers
+	 * the lane to the new session under the SAME @name — peers keep addressing it,
+	 * worktree/branch stay put. Both clears are required: clearSession drops the forced
+	 * resume id; invalidate drops the lane→session record that "auto" would reload.
+	 *
+	 * Refuses while the agent is busy (clearing state under a live turn corrupts it).
+	 * Returns the re-seed brief the caller should SEND to put the fresh session back in
+	 * role (explicit reBrief > captured standing brief > synthesized handoff), behind a
+	 * rotation banner. Does NOT send anything itself — the caller dispatches it like any
+	 * message, so the fresh turn mints the new session.
+	 */
+	function resetPersistentSession(name: string, reBrief?: string): { name: string; brief: string } | { error: string; busy?: boolean } {
+		const meta = persistentAgents.byName(name);
+		if (!meta) {
+			const roster = persistentAgents.all().map((m) => `@${m.name}`).join(", ") || "none";
+			return { error: `No persistent agent named "${name}". Current persistent agents: ${roster}.` };
+		}
+		if (agentGate.has(meta.loomId) || isAgentBusy(meta.loomId, meta.laneKey)) {
+			return { error: `@${meta.name} is busy right now — rotate at its next idle boundary, or /kill to force.`, busy: true };
+		}
+		const oldSession = meta.sessionId;
+		persistentAgents.clearSession(meta.loomId);
+		laneRegistry.invalidate(meta.laneKey);
+		if (oldSession) acpSessionCumulative.delete(oldSession);
+		peekStore.drop(meta.laneKey); // the captured peek belongs to the retired session
+		const banner =
+			`[session rotation] You (@${meta.name}, ${meta.harness}) have been moved to a FRESH session to shed accumulated context — your prior in-session conversation is gone, but your files, worktree (${meta.cwd}), and any review artifacts on disk are intact; re-read whatever you need from disk. Do NOT redo work that is already committed — check \`git log\` on your branch first. Your standing role follows for context; the orchestrator sends your next concrete work order separately.`;
+		let role = reBrief?.trim() ? reBrief.trim() : meta.standingBrief;
+		if (!role) {
+			const recent = persistentAgents
+				.history(meta.loomId)
+				.slice(-3)
+				.map((e) => `- ${e.prompt.slice(0, 200).replace(/\n/g, " ")}`)
+				.join("\n");
+			role = recent
+				? `No stored role brief was captured. Your recent work (most recent last):\n${recent}\nContinue from there; ask the orchestrator if the role is unclear.`
+				: `No stored role brief was captured and no history exists. Ask the orchestrator to re-state your role.`;
+		}
+		return { name: meta.name, brief: `${banner}\n\n${role}` };
+	}
+
 	// --- Agent-comms Phase 2: server-side routing + loop-safety -----------------
 	const commsDeps: CommsDeps = {
 		nameOf: (loomId: string): string | undefined => persistentAgents.get(loomId)?.name ?? registry.get(loomId)?.name,
@@ -682,9 +792,11 @@ export function createPersistentRuntime(deps: PersistDeps) {
 	return {
 		messagePersistent,
 		killPersistent,
+		resetPersistentSession,
 		registerSpawnTurnAbort,
 		isAgentBusy,
 		isMessageQueued,
+		orchestratorPending: (loomId: string): number => orchestratorOutstanding.get(loomId) ?? 0,
 		onDelegationStart,
 		onPersistentTurnSettled,
 		receipt: (id: string): PeerReceipt | undefined => peerOutbox.receipt(id),

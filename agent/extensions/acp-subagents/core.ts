@@ -743,12 +743,42 @@ export function asResumeBloatError(error: unknown): AcpResumeBloatError {
 	const original = error instanceof Error ? error.message : String(error);
 	return new AcpResumeBloatError(
 		`ACP resume-bloat: ${original}. This session's transcript is past the adapter's resume limit; the lane was invalidated. ` +
-			`Rotate: dismiss the worker (persistent_agent kill) and respawn with a file-based handoff — reviews, specs, and commit hashes carry its durable state.`,
+			`Rotate: use persistent_agent action:"rotate" (a fresh session under the same @name/lane/worktree, re-seeded from the standing brief and on-disk state) — or dismiss+respawn with a file-based handoff if you need to change harness.`,
 	);
 }
 
 /** Resume-bloat error class: lane invalidating, rotation-directed. */
 export class AcpResumeBloatError extends Error {}
+
+/**
+ * Provider-quota signature: the ACP turn fails because the account/provider is
+ * rate-limited, NOT because the session or lane is broken (observed 2026-09-06:
+ * claude "You've hit your session limit · resets <time>"; codex "usage_limit_reached").
+ * The lane stays healthy (shouldInvalidateLane returns false for this), so the
+ * session resumes fine once the provider's window resets — the seat should reroster
+ * to a different provider meanwhile, never respawn/rotate on the same one. Signatures
+ * are kept to the ones observed in the wild so a transient error is not misread.
+ */
+export function isQuotaError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /you've hit your session limit|usage[_ ]limit[_ ]reached|session limit reached/i.test(message);
+}
+
+/**
+ * Translate a provider-quota failure into an error whose text tells the orchestrator
+ * to reroster rather than hammer the rate-limited provider — and preserves the
+ * original message, which carries the reset time.
+ */
+export function asQuotaError(error: unknown, harness?: string): AcpQuotaError {
+	const original = error instanceof Error ? error.message : String(error);
+	const provider = harness ? ` on "${harness}"` : "";
+	return new AcpQuotaError(
+		`ACP provider quota${provider}: ${original}. This is a provider/account rate limit, NOT a broken session — the lane stays resumable and works again after the window resets (see the time in the message above). Do NOT respawn or rotate this worker on the same harness/provider; reroster this seat to a DIFFERENT provider (e.g. cursor/grok, codex) now, and resume${provider ? ` on "${harness}"` : ""} after the reset. A sibling worker on the same provider is likely dark too.`,
+	);
+}
+
+/** Provider-quota error class: lane stays resumable, reroster-directed. */
+export class AcpQuotaError extends Error {}
 
 /** A fleet barrier halted an older generation; its ACP lane stays resumable. */
 export class AcpStaleGenerationError extends Error {}
