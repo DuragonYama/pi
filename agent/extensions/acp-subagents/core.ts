@@ -761,7 +761,9 @@ export class AcpResumeBloatError extends Error {}
  */
 export function isQuotaError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : String(error);
-	return /you've hit your session limit|usage[_ ]limit[_ ]reached|session limit reached/i.test(message);
+	// Match "hit your session limit" without the apostrophe so a straight OR curly
+	// "you've/you’ve" both classify.
+	return /hit your session limit|usage[_ ]limit[_ ]reached|session limit reached/i.test(message);
 }
 
 /**

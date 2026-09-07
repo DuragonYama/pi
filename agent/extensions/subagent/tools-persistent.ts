@@ -146,13 +146,22 @@ export function registerPersistentAgentTool(
 				if (!params.name) return asText("rotate requires 'name'.");
 				const reset = persist.resetPersistentSession(params.name, params.task);
 				if ("error" in reset) return asText(reset.error);
+				// The session is already reset here; if the re-brief fails to land, the
+				// worker is session-less with NO role — surface that loudly as a follow-up
+				// (both the error-result and thrown paths) so the orchestrator re-briefs it,
+				// rather than only a UI notify that leaves "identity durable" quietly broken.
+				const rotateFailed = (why: string): void => {
+					pi.sendUserMessage(
+						`[persistent_agent] Rotate of @${reset.name}: the session was reset but the re-brief did NOT land (${why}). @${reset.name} is now session-less with no role — re-send its role brief with a normal message.`,
+						{ deliverAs: "followUp" },
+					);
+				};
 				void persist.messagePersistent(reset.name, reset.brief, ctx, { busyMode: "queue", owner: "orchestrator" })
 					.then((r) => {
-						pi.sendUserMessage(buildPersistentFollowUp(r.name ?? reset.name, r), { deliverAs: "followUp" });
+						if (r.error) rotateFailed(r.error);
+						else pi.sendUserMessage(buildPersistentFollowUp(r.name ?? reset.name, r), { deliverAs: "followUp" });
 					})
-					.catch((error) => {
-						if (ctx.hasUI) ctx.ui.notify(`@${reset.name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
-					});
+					.catch((error) => rotateFailed(error instanceof Error ? error.message : String(error)));
 				return asText(`Rotated @${reset.name} onto a fresh session (same @name, lane, and worktree; prior session retired). Re-brief dispatched${params.task ? "" : " from its captured standing brief"}; its acknowledgement arrives as a follow-up.`);
 			}
 			// message — owner:"orchestrator" so a user /dm! won't abort π's own turn.
